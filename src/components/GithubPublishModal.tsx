@@ -21,11 +21,11 @@ export const GithubPublishModal: React.FC<GithubPublishModalProps> = ({
     setTimeout(() => setCopiedStep(null), 2000);
   };
 
-  const cleanRepoUrl = repoUrl.trim() || 'https://github.com/<username>/<repo_name>.git';
+  const cleanRepoUrl = repoUrl.trim() || 'https://github.com/<username>/Filter-stock-vnindex-.git';
 
-  const commandStep1 = `git remote add origin ${cleanRepoUrl}\ngit push -u origin main`;
-  const commandStep2 = `git tag -a v1.0.0 -m "Bản phát hành đầu tiên v1.0.0"\ngit push origin v1.0.0`;
-  const oneLineCommand = `./publish_to_github.sh ${cleanRepoUrl}`;
+  const commandStep1 = `git remote add origin ${cleanRepoUrl} 2>/dev/null || git remote set-url origin ${cleanRepoUrl}\ngit push -u origin main --force`;
+  const commandStep2 = `git tag -fa v1.0.1 -m "Bản cập nhật v1.0.1 sửa lỗi build APK"\ngit push origin v1.0.1 --force`;
+  const oneLineCommand = `./publish_to_github.sh ${cleanRepoUrl} v1.0.1`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in duration-200">
