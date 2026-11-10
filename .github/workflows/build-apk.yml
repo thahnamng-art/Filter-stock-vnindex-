@@ -2,21 +2,18 @@ name: Build & Release Android APK
 
 on:
   push:
+    branches:
+      - main
+      - master
+      - '**'
     tags:
       - 'v*'
   release:
     types: [created, published]
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: 'Loại bản dựng APK (both, debug, hoặc release)'
-        required: true
-        default: 'both'
-        type: choice
-        options:
-          - both
-          - debug
-          - release
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-android-apk:
@@ -29,69 +26,60 @@ jobs:
       - name: 1. Checkout repository
         uses: actions/checkout@v4
 
-      - name: 2. Set up Node.js LTS
+      - name: 2. Set up Node.js 22 LTS
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: 3. Set up Java JDK 17
-        uses: actions/setup-java@v4
+      - name: 3. Set up Java JDK 21 (Required by Capacitor 8 & Gradle 8.14)
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      - name: 4. Set up Gradle Action
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: 5. Accept Android SDK Licenses
+      - name: 4. Accept Android SDK Licenses & Install SDK 36
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0" 2>/dev/null || true
 
-      - name: 6. Install NPM Dependencies
+      - name: 5. Install NPM Dependencies
         run: |
           npm install --legacy-peer-deps
 
-      - name: 7. Build Web Assets (Vite)
+      - name: 6. Build Web Assets (Vite)
         run: |
           npm run build
 
-      - name: 8. Sync Capacitor Android
+      - name: 7. Initialize Clean Native Android Project & Sync Capacitor
         run: |
+          rm -rf android
+          npx cap add android
           npx cap sync android
+          chmod +x android/gradlew
 
-      - name: 9. Grant execute permission for gradlew
-        run: chmod +x android/gradlew
-
-      - name: 10. Build Debug APK (Cài đặt ngay trên điện thoại)
-        if: ${{ github.event.inputs.build_type != 'release' }}
+      - name: 8. Build Debug APK (Cài đặt trực tiếp trên mọi máy Android)
         run: |
           cd android
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --no-daemon --stacktrace
           cd ..
           mkdir -p release-apks
           find android/app/build/outputs/apk/debug -name "*.apk" -exec cp {} release-apks/fialda-quant-screener-debug.apk \;
+          ls -lh release-apks/
 
-      - name: 11. Build Release APK (Bản phát hành)
-        if: ${{ github.event.inputs.build_type != 'debug' }}
-        run: |
-          cd android
-          ./gradlew assembleRelease --no-daemon || true
-          cd ..
-          mkdir -p release-apks
-          find android/app/build/outputs/apk/release -name "*.apk" -exec cp {} release-apks/fialda-quant-screener-release.apk \; 2>/dev/null || true
-
-      - name: 12. Upload APK Artifacts (Lưu trữ tải về trực tiếp)
+      - name: 9. Upload APK to GitHub Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: fialda-quant-apk
           path: release-apks/*.apk
+          if-no-files-found: error
           retention-days: 30
 
-      - name: 13. Attach APK to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+      - name: 10. Auto-Publish APK to GitHub Releases
         continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v1.0.{0}', github.run_number) }}
+          name: "Fialda Quant Screener APK - Build #${{ github.run_number }}"
           files: release-apks/*.apk
           generate_release_notes: true
           draft: false
@@ -99,11 +87,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 14. Build Summary
+      - name: 11. Build Summary
         run: |
-          echo "### 🚀 Bản dựng Android APK hoàn tất thành công!" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Bản dựng Android APK hoàn tất thành công!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Các file APK đã được tạo:**" >> $GITHUB_STEP_SUMMARY
+          echo "**File APK đã tạo:**" >> $GITHUB_STEP_SUMMARY
           ls -lh release-apks/ >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Tải file APK trực tiếp tại mục **Artifacts** bên trên hoặc tab **Releases** của repository!" >> $GITHUB_STEP_SUMMARY
+          echo "👉 Tải file **fialda-quant-screener-debug.apk** tại mục **Artifacts** bên dưới hoặc trong mục **Releases** của kho lưu trữ GitHub!" >> $GITHUB_STEP_SUMMARY
