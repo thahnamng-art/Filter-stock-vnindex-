@@ -1,0 +1,6 @@
+{
+  "name": "Fialda Quant - VNStock Realtime Screener",
+  "description": "Bộ lọc cổ phiếu chứng khoán Việt Nam thời gian thực với Dynamic Rule Engine tùy biến cao, chỉ báo RS 52w/1m, Dynamic RSI, Multi MA, MCDX Banker và Volume Spike.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

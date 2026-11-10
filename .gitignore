@@ -1,0 +1,30 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite
+*.sqlite3
+*.db
+!src/data/realMarketData.json
+.pytest_cache/
+.venv/
+env/
+venv/
+
+# Android
+.gradle/
+local.properties
+android/build/
+android/app/build/
+android/.gradle/
+*.apk
+*.aab

@@ -1,0 +1,93 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [created, published]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Loại bản dựng APK (debug hoặc release)'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - debug
+          - release
+
+jobs:
+  build-android-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 1. Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: 3. Set up Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 4. Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Install NPM Dependencies
+        run: npm install
+
+      - name: 6. Build Web Assets (Vite)
+        run: npm run build
+
+      - name: 7. Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: 8. Grant execute permission for gradlew
+        run: chmod +x android/gradlew
+
+      - name: 9. Build Debug APK (Cài đặt ngay không cần ký)
+        if: ${{ github.event.inputs.build_type != 'release' }}
+        run: |
+          cd android
+          ./gradlew assembleDebug
+          cd ..
+          mkdir -p release-apks
+          cp android/app/build/outputs/apk/debug/app-debug.apk release-apks/fialda-quant-screener-${{ github.ref_name || 'latest' }}-debug.apk
+
+      - name: 10. Build Release APK
+        if: ${{ github.event.inputs.build_type != 'debug' }}
+        run: |
+          cd android
+          ./gradlew assembleRelease
+          cd ..
+          mkdir -p release-apks
+          cp android/app/build/outputs/apk/release/app-release-unsigned.apk release-apks/fialda-quant-screener-${{ github.ref_name || 'latest' }}-release-unsigned.apk
+
+      - name: 11. Upload APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fialda-quant-apk-${{ github.ref_name || 'latest' }}
+          path: release-apks/*.apk
+          retention-days: 30
+
+      - name: 12. Attach APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-apks/*.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
