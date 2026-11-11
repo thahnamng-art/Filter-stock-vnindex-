@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, TrendingUp, Activity, Layers, BarChart2, DollarSign, Database, Check } from 'lucide-react';
+import { X, TrendingUp, Activity, Layers, BarChart2, DollarSign, Database, Check, Calendar } from 'lucide-react';
 import { AnyFilterRule, RuleType } from '../types/screener';
 
 interface AddRuleModalProps {
@@ -20,14 +20,30 @@ interface RuleOption {
 export const AddRuleModal: React.FC<AddRuleModalProps> = ({
   isOpen,
   onClose,
-  onAddRule,
-  existingRulesCount
+  onAddRule
 }) => {
   if (!isOpen) return null;
 
   const generateId = (prefix: string) => `${prefix}_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
 
   const ruleOptions: RuleOption[] = [
+    {
+      type: 'DATE_FILTER',
+      title: 'Lọc theo Ngày giao dịch & Biến động phiên',
+      desc: 'Chọn ngày giao dịch cần lọc (Hôm nay hoặc Backtest quá khứ T-N) và lọc hiệu suất % thay đổi giá trong N phiên.',
+      icon: <Calendar className="w-5 h-5 text-cyan-400" />,
+      factory: (id) => ({
+        id,
+        rule_type: 'DATE_FILTER',
+        name: 'Lọc theo Ngày & Biến động',
+        enabled: true,
+        target_date: '2026-11-10',
+        offset_days: 0,
+        lookback_days: 1,
+        min_return_pct: -30,
+        max_return_pct: 50
+      })
+    },
     {
       type: 'PRICE_VS_MA',
       title: 'Đường Trung bình động (MA)',
@@ -47,7 +63,7 @@ export const AddRuleModal: React.FC<AddRuleModalProps> = ({
     {
       type: 'MCDX',
       title: 'Dòng tiền tạo lập MCDX',
-      desc: 'Chỉ báo Banker (tiền lớn), Hot Money (đầu cơ), Retailer (nhỏ lẻ) theo chuẩn Fialda Quant.',
+      desc: 'Lọc cổ phiếu có dòng tiền Banker / Hot Money từ mức thấp cắt lên qua mốc 25%, 50%, 75%.',
       icon: <Layers className="w-5 h-5 text-rose-400" />,
       factory: (id) => ({
         id,
@@ -55,9 +71,10 @@ export const AddRuleModal: React.FC<AddRuleModalProps> = ({
         name: 'Dòng tiền tạo lập MCDX',
         enabled: true,
         component: 'BANKER',
-        operator: '>=',
+        operator: 'CROSS_ABOVE',
         threshold: 25.0,
         require_rising: true,
+        cross_lookback: 3,
         period_banker: 50,
         base_banker: 50.0
       })

@@ -8,11 +8,12 @@ export type MaOperator = '>' | '>=' | '<' | '<=' | 'CROSS_ABOVE' | 'CROSS_BELOW'
 
 export type McdxComponent = 'BANKER' | 'HOT_MONEY' | 'RETAILER';
 
-export type McdxOperator = '>=' | '>' | '<=';
+export type McdxOperator = 'CROSS_ABOVE' | 'CROSS_BELOW' | '>=' | '>' | '<=';
 
 export type VolumeOperator = '>=' | '>';
 
 export type RuleType = 
+  | 'DATE_FILTER'
   | 'EXCHANGE'
   | 'BCTC'
   | 'VALUE'
@@ -28,6 +29,15 @@ export interface BaseRule {
   rule_type: RuleType;
   name: string;
   enabled: boolean;
+}
+
+export interface DateFilterRule extends BaseRule {
+  rule_type: 'DATE_FILTER';
+  target_date: string;      // YYYY-MM-DD (e.g. '2026-11-10')
+  offset_days: number;      // 0 = Hôm nay, 1 = T-1, 5 = 1 tuần trước, ... (0..60)
+  lookback_days: number;    // Số phiên tính biến động giá (1, 3, 5, 10, 20...)
+  min_return_pct: number;   // % thay đổi tối thiểu (e.g. -30)
+  max_return_pct: number;   // % thay đổi tối đa (e.g. +50)
 }
 
 export interface ExchangeRule extends BaseRule {
@@ -80,8 +90,9 @@ export interface McdxRule extends BaseRule {
   rule_type: 'MCDX';
   component: McdxComponent;
   operator: McdxOperator;
-  threshold: number; // 0 - 100%
+  threshold: number; // 0, 25, 50, 75, 100%
   require_rising: boolean;
+  cross_lookback?: number; // Số phiên xét cắt qua từ mức thấp (mặc định 1..3 phiên)
   period_banker: number; // default 50
   base_banker: number;   // default 50.0
 }
@@ -94,6 +105,7 @@ export interface VolumeSpikeRule extends BaseRule {
 }
 
 export type AnyFilterRule = 
+  | DateFilterRule
   | ExchangeRule
   | BctcRule
   | ValueRule

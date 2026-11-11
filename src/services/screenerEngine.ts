@@ -107,30 +107,37 @@ export function calculateMA(prices: number[], period: number, maType: MaType): n
   return ma;
 }
 
-// Compute MCDX breakdown for a stock
+// Compute MCDX breakdown for a stock (including recent 6-bar history for crossover detection)
 export function computeMcdxValues(prices: number[], periodBanker: number = 50, baseBanker: number = 50.0) {
   const windowPrices = prices.length > 110 ? prices.slice(-110) : prices;
   const rsiBanker = calculateRSI(windowPrices, periodBanker);
   const rsiHot = calculateRSI(windowPrices, 40);
 
   const len = windowPrices.length;
-  const currRsiBanker = rsiBanker[len - 1] || 50;
-  const prevRsiBanker = rsiBanker[len - 2] || 50;
+  const historyBars = Math.min(6, len);
+  const bankerHistory: number[] = [];
+  const hotHistory: number[] = [];
+  const retailerHistory: number[] = [];
 
-  const bankerRaw = 1.5 * (currRsiBanker - baseBanker);
-  const banker = Math.round(Math.max(0, Math.min(20, bankerRaw)) * 5 * 10) / 10;
+  for (let offset = historyBars - 1; offset >= 0; offset--) {
+    const idx = len - 1 - offset;
+    const rB = rsiBanker[idx] ?? 50;
+    const rH = rsiHot[idx] ?? 50;
+    const bVal = Math.round(Math.max(0, Math.min(20, 1.5 * (rB - baseBanker))) * 5 * 10) / 10;
+    const hVal = Math.round(Math.max(0, Math.min(20, 2.0 * (rH - 45.0))) * 5 * 10) / 10;
+    const retVal = Math.round(Math.max(0, Math.min(100, 100 - bVal - hVal)) * 10) / 10;
+    bankerHistory.push(bVal);
+    hotHistory.push(hVal);
+    retailerHistory.push(retVal);
+  }
 
-  const prevBankerRaw = 1.5 * (prevRsiBanker - baseBanker);
-  const prevBanker = Math.max(0, Math.min(20, prevBankerRaw)) * 5;
-
-  const currRsiHot = rsiHot[len - 1] || 50;
-  const prevRsiHot = rsiHot[len - 2] || 50;
-  const hotRaw = 2.0 * (currRsiHot - 45.0);
-  const hotMoney = Math.round(Math.max(0, Math.min(20, hotRaw)) * 5 * 10) / 10;
-  const prevHot = Math.max(0, Math.min(20, 2.0 * (prevRsiHot - 45.0))) * 5;
-
-  const retailer = Math.round(Math.max(0, Math.min(100, 100 - banker - hotMoney)) * 10) / 10;
-  const prevRetailer = Math.max(0, Math.min(100, 100 - prevBanker - prevHot));
+  const hLen = bankerHistory.length;
+  const banker = bankerHistory[hLen - 1] ?? 0;
+  const prevBanker = bankerHistory[hLen - 2] ?? banker;
+  const hotMoney = hotHistory[hLen - 1] ?? 0;
+  const prevHot = hotHistory[hLen - 2] ?? hotMoney;
+  const retailer = retailerHistory[hLen - 1] ?? 100;
+  const prevRetailer = retailerHistory[hLen - 2] ?? retailer;
 
   return {
     banker,
@@ -139,22 +146,29 @@ export function computeMcdxValues(prices: number[], periodBanker: number = 50, b
     prevHot,
     retailer,
     prevRetailer,
+    bankerHistory,
+    hotHistory,
+    retailerHistory,
     isBankerRising: banker > prevBanker,
     isHotMoneyRising: hotMoney > prevHot
   };
 }
 
-// Calculate Market RS Percentile Rank (1 to 99) for all 1,626 stocks
-export function computeMarketRsRankings(stocks: StockData[], periodDays: number): Map<string, number> {
+// Calculate Market RS Percentile Rank (1 to 99) for all 1,626 stocks at a given historical offset
+export function computeMarketRsRankings(
+  stocks: StockData[],
+  periodDays: number,
+  offsetDays: number = 0
+): Map<string, number> {
   const returns: { symbol: string; ret: number }[] = new Array(stocks.length);
 
   for (let i = 0; i < stocks.length; i++) {
     const s = stocks[i];
     const closes = s.historical_closes;
-    const len = closes.length;
-    const lookback = Math.min(len - 1, periodDays);
-    const currPrice = closes[len - 1];
-    const pastPrice = closes[len - 1 - lookback] || currPrice;
+    const endIdx = Math.max(1, closes.length - offsetDays);
+    const lookback = Math.min(endIdx - 1, periodDays);
+    const currPrice = closes[endIdx - 1];
+    const pastPrice = closes[endIdx - 1 - lookback] || currPrice;
     const ret = pastPrice > 0 ? (currPrice - pastPrice) / pastPrice : 0;
     returns[i] = { symbol: s.symbol, ret };
   }
@@ -177,11 +191,20 @@ export function evaluateScreener(
   rules: AnyFilterRule[],
   sessionMinutes: number = 180
 ): StockData[] {
+  const activeRules = rules.filter((r) => r.enabled);
+
+  // Check if a DATE_FILTER rule is active to determine historical session offset (T-0, T-1, T-5...)
+  const activeDateRule = activeRules.find((r) => r.rule_type === 'DATE_FILTER');
+  const offsetDays =
+    activeDateRule && activeDateRule.rule_type === 'DATE_FILTER'
+      ? Math.max(0, Math.min(55, activeDateRule.offset_days || 0))
+      : 0;
+
   const rsCache = new Map<number, Map<string, number>>();
   const getRsMap = (days: number) => {
     let m = rsCache.get(days);
     if (!m) {
-      m = computeMarketRsRankings(stocks, days);
+      m = computeMarketRsRankings(stocks, days, offsetDays);
       rsCache.set(days, m);
     }
     return m;
@@ -190,14 +213,40 @@ export function evaluateScreener(
   const rs52Map = getRsMap(260);
   const rs1mMap = getRsMap(21);
 
-  const activeRules = rules.filter((r) => r.enabled);
-  const sessionRatio = sessionMinutes / TOTAL_SESSION_MINUTES;
+  const sessionRatio = offsetDays > 0 ? 1.0 : sessionMinutes / TOTAL_SESSION_MINUTES;
 
   return stocks.map((stock) => {
-    const closes = stock.historical_closes;
-    const volumes = stock.historical_volumes;
+    const fullCloses = stock.historical_closes;
+    const fullVolumes = stock.historical_volumes;
+    const closes =
+      offsetDays > 0 && fullCloses.length > offsetDays + 20
+        ? fullCloses.slice(0, fullCloses.length - offsetDays)
+        : fullCloses;
+    const volumes =
+      offsetDays > 0 && fullVolumes.length > offsetDays + 2
+        ? fullVolumes.slice(0, fullVolumes.length - offsetDays)
+        : fullVolumes;
+
     const len = closes.length;
     const vLen = volumes.length;
+
+    // Historical or current session price, change, volume, and value
+    const evalPrice = offsetDays > 0 ? closes[len - 1] : stock.price;
+    const prevClose = closes[len - 2] || evalPrice;
+    const evalChange =
+      offsetDays > 0 ? Math.round((evalPrice - prevClose) * 100) / 100 : stock.change;
+    const evalChangePct =
+      offsetDays > 0
+        ? prevClose > 0
+          ? Math.round((evalChange / prevClose) * 10000) / 100
+          : 0
+        : stock.change_pct;
+    const evalVolume =
+      offsetDays > 0 ? volumes[vLen - 1] || stock.total_volume : stock.total_volume;
+    const evalValue =
+      offsetDays > 0
+        ? Math.max(0.1, Math.round(((evalVolume * evalPrice * 1000) / 1e9) * 10) / 10)
+        : stock.total_value;
 
     const rs52 = rs52Map.get(stock.symbol) || 50;
     const rs1m = rs1mMap.get(stock.symbol) || 50;
@@ -221,10 +270,10 @@ export function evaluateScreener(
       volSum += volumes[i];
       volCount++;
     }
-    const avgDailyVol = volCount > 0 ? volSum / volCount : stock.total_volume;
+    const avgDailyVol = volCount > 0 ? volSum / volCount : evalVolume;
     const expectedIntradayVol = avgDailyVol * sessionRatio;
     const volumeSpikeRatio =
-      expectedIntradayVol > 0 ? Math.round((stock.total_volume / expectedIntradayVol) * 100) : 100;
+      expectedIntradayVol > 0 ? Math.round((evalVolume / expectedIntradayVol) * 100) : 100;
 
     let passedCount = 0;
     let isMatched = true;
@@ -234,6 +283,14 @@ export function evaluateScreener(
       let passedThisRule = false;
 
       switch (rule.rule_type) {
+        case 'DATE_FILTER': {
+          const lb = Math.max(1, Math.min(len - 1, rule.lookback_days || 1));
+          const currP = closes[len - 1];
+          const baseP = closes[len - 1 - lb] || currP;
+          const retPct = baseP > 0 ? ((currP - baseP) / baseP) * 100 : 0;
+          passedThisRule = retPct >= rule.min_return_pct && retPct <= rule.max_return_pct;
+          break;
+        }
         case 'EXCHANGE': {
           passedThisRule = rule.exchanges.includes(stock.exchange);
           break;
@@ -243,7 +300,7 @@ export function evaluateScreener(
           break;
         }
         case 'VALUE': {
-          passedThisRule = stock.total_value >= rule.min_value && stock.total_value <= rule.max_value;
+          passedThisRule = evalValue >= rule.min_value && evalValue <= rule.max_value;
           break;
         }
         case 'EPS': {
@@ -295,19 +352,38 @@ export function evaluateScreener(
 
           let compVal = customMcdx.banker;
           let prevCompVal = customMcdx.prevBanker;
+          let compHistory = customMcdx.bankerHistory;
 
           if (rule.component === 'HOT_MONEY') {
             compVal = customMcdx.hotMoney;
             prevCompVal = customMcdx.prevHot;
+            compHistory = customMcdx.hotHistory;
           } else if (rule.component === 'RETAILER') {
             compVal = customMcdx.retailer;
             prevCompVal = customMcdx.prevRetailer;
+            compHistory = customMcdx.retailerHistory;
           }
 
+          const lookback = Math.max(1, Math.min(5, rule.cross_lookback || 3));
+          const hLen = compHistory.length;
+          const prevSlice = compHistory.slice(Math.max(0, hLen - 1 - lookback), hLen - 1);
+          const minPrev = prevSlice.length > 0 ? Math.min(...prevSlice) : prevCompVal;
+          const maxPrev = prevSlice.length > 0 ? Math.max(...prevSlice) : prevCompVal;
+
           let compPassed = false;
-          if (rule.operator === '>=') compPassed = compVal >= rule.threshold;
-          else if (rule.operator === '>') compPassed = compVal > rule.threshold;
-          else if (rule.operator === '<=') compPassed = compVal <= rule.threshold;
+          if (rule.operator === 'CROSS_ABOVE') {
+            // Từ mức thấp (< threshold) trong lookback phiên trước cắt lên qua mức threshold (>= threshold)
+            compPassed = compVal >= rule.threshold && minPrev < rule.threshold;
+          } else if (rule.operator === 'CROSS_BELOW') {
+            // Từ mức cao (> threshold) trong lookback phiên trước cắt xuống dưới mức threshold (<= threshold)
+            compPassed = compVal <= rule.threshold && maxPrev > rule.threshold;
+          } else if (rule.operator === '>=') {
+            compPassed = compVal >= rule.threshold;
+          } else if (rule.operator === '>') {
+            compPassed = compVal > rule.threshold;
+          } else if (rule.operator === '<=') {
+            compPassed = compVal <= rule.threshold;
+          }
 
           if (rule.require_rising) {
             compPassed = compPassed && compVal > prevCompVal;
@@ -324,9 +400,9 @@ export function evaluateScreener(
             sumV += volumes[i];
             cntV++;
           }
-          const avgVol = cntV > 0 ? sumV / cntV : stock.total_volume;
+          const avgVol = cntV > 0 ? sumV / cntV : evalVolume;
           const expectedVol = avgVol * sessionRatio;
-          const ratio = expectedVol > 0 ? (stock.total_volume / expectedVol) * 100 : 100;
+          const ratio = expectedVol > 0 ? (evalVolume / expectedVol) * 100 : 100;
 
           if (rule.operator === '>') {
             passedThisRule = ratio > rule.percent_threshold;
@@ -346,6 +422,11 @@ export function evaluateScreener(
 
     return {
       ...stock,
+      price: evalPrice,
+      change: evalChange,
+      change_pct: evalChangePct,
+      total_volume: evalVolume,
+      total_value: evalValue,
       rs_52w: rs52,
       rs_1m: rs1m,
       rsi_14: Math.round(rsi14 * 10) / 10,

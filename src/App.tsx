@@ -11,7 +11,8 @@ import {
   TableProperties,
   RefreshCw,
   CheckCircle2,
-  Github
+  Github,
+  CandlestickChart
 } from 'lucide-react';
 import { AnyFilterRule, StockData, ScreenerPreset, ExchangeType } from './types/screener';
 import {
@@ -31,9 +32,21 @@ import { PythonInspectorModal } from './components/PythonInspectorModal';
 import { GithubPublishModal } from './components/GithubPublishModal';
 import { SyncInspectorModal } from './components/SyncInspectorModal';
 import { ScreenerTable } from './components/ScreenerTable';
+import { FialdaTechnicalChart } from './components/FialdaTechnicalChart';
 
 // Default initial rules across all 3 exchanges (HOSE, HNX, UPCOM)
 const INITIAL_RULES: AnyFilterRule[] = [
+  {
+    id: 'r_date',
+    rule_type: 'DATE_FILTER',
+    name: 'Lọc theo Ngày & Biến động',
+    enabled: true,
+    target_date: '2026-11-10',
+    offset_days: 0,
+    lookback_days: 1,
+    min_return_pct: -30.0,
+    max_return_pct: 50.0
+  },
   {
     id: 'r_exchange',
     rule_type: 'EXCHANGE',
@@ -85,9 +98,10 @@ const INITIAL_RULES: AnyFilterRule[] = [
     name: 'Dòng tiền Banker (Tiền lớn)',
     enabled: true,
     component: 'BANKER',
-    operator: '>=',
+    operator: 'CROSS_ABOVE',
     threshold: 25.0,
     require_rising: true,
+    cross_lookback: 3,
     period_banker: 50,
     base_banker: 50.0
   },
@@ -116,8 +130,8 @@ export default function App() {
   const [presets, setPresets] = useState<ScreenerPreset[]>([
     {
       id: 'preset_banker_breakout',
-      name: 'Dòng tiền Banker bứt phá',
-      description: 'MCDX Banker >= 25% đang tăng, khối lượng tăng vọt và RS52w >= 70',
+      name: 'Dòng tiền Banker cắt lên 25%',
+      description: 'MCDX Banker từ mức thấp cắt lên qua 25%, khối lượng tăng vọt và RS52w >= 70',
       isCustom: false,
       rules: INITIAL_RULES
     },
@@ -159,7 +173,9 @@ export default function App() {
   ]);
 
   // UI Navigation states
-  const [activeTab, setActiveTab] = useState<'BUILDER' | 'RESULTS'>('BUILDER');
+  const [activeTab, setActiveTab] = useState<'BUILDER' | 'RESULTS' | 'CHART'>('BUILDER');
+  const [desktopRightTab, setDesktopRightTab] = useState<'RESULTS' | 'CHART'>('RESULTS');
+  const [chartSymbol, setChartSymbol] = useState<string>('CDC');
   const [viewMode, setViewMode] = useState<'MOBILE' | 'DESKTOP'>('MOBILE');
 
   // Realtime 5s timer states
@@ -346,6 +362,20 @@ export default function App() {
   const matchedStocks = useMemo(() => {
     return evaluatedStocks.filter((s) => s.is_matched);
   }, [evaluatedStocks]);
+
+  const activeChartStock = useMemo(() => {
+    return (
+      evaluatedStocks.find((s) => s.symbol === chartSymbol) ||
+      matchedStocks[0] ||
+      evaluatedStocks[0]
+    );
+  }, [evaluatedStocks, matchedStocks, chartSymbol]);
+
+  const handleOpenStockChart = (stock: StockData) => {
+    setChartSymbol(stock.symbol);
+    setActiveTab('CHART');
+    setDesktopRightTab('CHART');
+  };
 
   // Rule operations
   const handleToggleRule = (id: string) => {
@@ -563,35 +593,37 @@ export default function App() {
               </div>
             </div>
 
-            {/* Preset Selector Chips Bar */}
-            <div className="px-3 py-2 bg-[#090d14] border-b border-[#18202d] flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
-              {presets.slice(0, 5).map((p) => {
-                const isActive = p.id === activePresetId;
-                return (
-                  <button
-                    key={p.id}
-                    onClick={() => handleApplyPreset(p)}
-                    className={`px-2.5 py-1 rounded-full text-[11px] font-semibold whitespace-nowrap transition-colors flex items-center gap-1 shrink-0 ${
-                      isActive
-                        ? 'bg-purple-600 text-white shadow-sm'
-                        : 'bg-[#141b27] text-slate-400 hover:text-slate-200 border border-[#202b3d]'
-                    }`}
-                  >
-                    {isActive && <Sparkles className="w-3 h-3 text-purple-200" />}
-                    {p.name}
-                  </button>
-                );
-              })}
-              <button
-                onClick={() => setIsPresetModalOpen(true)}
-                className="px-2 py-1 rounded-full text-[11px] font-medium text-purple-400 hover:text-purple-300 bg-[#161c29] border border-purple-900/40 whitespace-nowrap shrink-0"
-              >
-                + Khác
-              </button>
-            </div>
+            {/* Preset Selector Chips Bar (Hidden when full-screen CHART tab is active) */}
+            {activeTab !== 'CHART' && (
+              <div className="px-3 py-2 bg-[#090d14] border-b border-[#18202d] flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
+                {presets.slice(0, 5).map((p) => {
+                  const isActive = p.id === activePresetId;
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => handleApplyPreset(p)}
+                      className={`px-2.5 py-1 rounded-full text-[11px] font-semibold whitespace-nowrap transition-colors flex items-center gap-1 shrink-0 ${
+                        isActive
+                          ? 'bg-purple-600 text-white shadow-sm'
+                          : 'bg-[#141b27] text-slate-400 hover:text-slate-200 border border-[#202b3d]'
+                      }`}
+                    >
+                      {isActive && <Sparkles className="w-3 h-3 text-purple-200" />}
+                      {p.name}
+                    </button>
+                  );
+                })}
+                <button
+                  onClick={() => setIsPresetModalOpen(true)}
+                  className="px-2 py-1 rounded-full text-[11px] font-medium text-purple-400 hover:text-purple-300 bg-[#161c29] border border-purple-900/40 whitespace-nowrap shrink-0"
+                >
+                  + Khác
+                </button>
+              </div>
+            )}
 
             {/* Dynamic Content Area: Tabs */}
-            <div className="flex-1 overflow-y-auto p-3.5">
+            <div className={`flex-1 overflow-y-auto ${activeTab === 'CHART' ? 'p-0 overflow-hidden flex flex-col' : 'p-3.5'}`}>
               {activeTab === 'BUILDER' ? (
                 /* TAB 1: BUILDER / ĐIỀU KIỆN ĐÃ CHỌN */
                 <div className="space-y-1">
@@ -625,13 +657,24 @@ export default function App() {
                   {/* Spacer for sticky bottom button */}
                   <div className="h-16" />
                 </div>
-              ) : (
+              ) : activeTab === 'RESULTS' ? (
                 /* TAB 2: REALTIME RESULTS */
                 <div className="h-full flex flex-col">
                   <ScreenerTable
                     stocks={matchedStocks}
                     totalUniverseCount={universeStats.total}
-                    onSelectStock={(stock) => setSelectedStockDetail(stock)}
+                    onSelectStock={handleOpenStockChart}
+                  />
+                </div>
+              ) : (
+                /* TAB 3: FIALDA 7-PANE TECHNICAL CHART */
+                <div className="h-full flex-1 flex flex-col overflow-hidden">
+                  <FialdaTechnicalChart
+                    selectedStock={activeChartStock}
+                    allStocks={evaluatedStocks}
+                    onSelectStock={(st) => setChartSymbol(st.symbol)}
+                    onOpenStockDetailModal={(st) => setSelectedStockDetail(st)}
+                    activeRulesCount={activeRulesCount}
                   />
                 </div>
               )}
@@ -651,8 +694,8 @@ export default function App() {
               </div>
             )}
 
-            {/* Fixed Mobile Bottom Tab Navigation */}
-            <div className="h-14 border-t border-[#1b2332] bg-[#0c1017] grid grid-cols-2 shrink-0 z-20">
+            {/* Fixed Mobile Bottom Tab Navigation (3 Tabs: Bộ lọc, Kết quả, Biểu đồ) */}
+            <div className="h-14 border-t border-[#1b2332] bg-[#0c1017] grid grid-cols-3 shrink-0 z-20">
               <button
                 onClick={() => setActiveTab('BUILDER')}
                 className={`flex flex-col items-center justify-center gap-1 transition-colors ${
@@ -671,11 +714,23 @@ export default function App() {
               >
                 <TableProperties className="w-4 h-4" />
                 <span className="text-[10px] tracking-tight">
-                  Kết quả ({matchedStocks.length.toLocaleString()} / {universeStats.total.toLocaleString()})
+                  Kết quả ({matchedStocks.length.toLocaleString()})
                 </span>
                 {matchedStocks.length > 0 && (
-                  <span className="absolute top-2 right-6 w-2 h-2 rounded-full bg-purple-500" />
+                  <span className="absolute top-2 right-5 w-2 h-2 rounded-full bg-purple-500" />
                 )}
+              </button>
+
+              <button
+                onClick={() => setActiveTab('CHART')}
+                className={`flex flex-col items-center justify-center gap-1 relative transition-colors ${
+                  activeTab === 'CHART' ? 'text-purple-400 font-bold' : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <CandlestickChart className="w-4 h-4" />
+                <span className="text-[10px] tracking-tight">
+                  Biểu đồ ({activeChartStock.symbol})
+                </span>
               </button>
             </div>
           </div>
@@ -759,13 +814,61 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right Column: Screener Table */}
+            {/* Right Column: Screener Table OR 7-Pane Technical Chart */}
             <div className="flex-1 flex flex-col bg-[#0c1017] overflow-hidden">
-              <ScreenerTable
-                stocks={matchedStocks}
-                totalUniverseCount={universeStats.total}
-                onSelectStock={(stock) => setSelectedStockDetail(stock)}
-              />
+              {/* Desktop Right Column Switcher Bar */}
+              <div className="h-11 border-b border-[#1e2738] bg-[#0e131d] px-4 flex items-center justify-between shrink-0">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDesktopRightTab('RESULTS')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                      desktopRightTab === 'RESULTS'
+                        ? 'bg-purple-600 text-white shadow-sm'
+                        : 'bg-[#151c29] text-slate-400 hover:text-slate-200 border border-[#222d40]'
+                    }`}
+                  >
+                    <TableProperties className="w-3.5 h-3.5" />
+                    <span>Kết quả lọc ({matchedStocks.length.toLocaleString()} mã)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDesktopRightTab('CHART')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                      desktopRightTab === 'CHART'
+                        ? 'bg-purple-600 text-white shadow-sm'
+                        : 'bg-[#151c29] text-slate-400 hover:text-slate-200 border border-[#222d40]'
+                    }`}
+                  >
+                    <CandlestickChart className="w-3.5 h-3.5" />
+                    <span>Biểu đồ Kỹ thuật 7 Tầng ({activeChartStock.symbol})</span>
+                  </button>
+                </div>
+
+                <span className="text-[11px] text-slate-400">
+                  {desktopRightTab === 'RESULTS'
+                    ? 'Chạm vào mã CP bất kỳ để mở Biểu đồ PTKT 7 tầng'
+                    : `Đang xem đồ thị ${activeChartStock.symbol} (${activeChartStock.exchange}) — Nhấn kính lúp 🔍 để tự nhập mã`}
+                </span>
+              </div>
+
+              <div className="flex-1 overflow-hidden flex flex-col">
+                {desktopRightTab === 'RESULTS' ? (
+                  <ScreenerTable
+                    stocks={matchedStocks}
+                    totalUniverseCount={universeStats.total}
+                    onSelectStock={handleOpenStockChart}
+                  />
+                ) : (
+                  <FialdaTechnicalChart
+                    selectedStock={activeChartStock}
+                    allStocks={evaluatedStocks}
+                    onSelectStock={(st) => setChartSymbol(st.symbol)}
+                    onOpenStockDetailModal={(st) => setSelectedStockDetail(st)}
+                    activeRulesCount={activeRulesCount}
+                  />
+                )}
+              </div>
             </div>
           </div>
         )}
