@@ -94,7 +94,7 @@ class MarketDataPipeline:
             raise RuntimeError("Không tìm thấy tệp dữ liệu thị trường thực tế realMarketData.json")
 
         symbol_names = [it["symbol"] for it in items]
-        n_days = min(len(it["historical_closes"]) for it in items)
+        n_days = 260
 
         close_matrix = np.zeros((n_days, len(symbol_names)))
         volume_matrix = np.zeros((n_days, len(symbol_names)))
@@ -108,14 +108,29 @@ class MarketDataPipeline:
             cursor = conn.cursor()
             for idx, it in enumerate(items):
                 sym = it["symbol"]
-                closes = it["historical_closes"][-n_days:]
-                volumes = it["historical_volumes"][-n_days:]
+                raw_closes = it["historical_closes"]
+                raw_vols = it["historical_volumes"]
+                p_52w = it.get("price_52w_ago", raw_closes[0] if raw_closes else it["price"])
+
+                if len(raw_closes) >= n_days:
+                    closes = np.array(raw_closes[-n_days:], dtype=float)
+                else:
+                    pad_len = n_days - len(raw_closes)
+                    interp = np.linspace(p_52w, raw_closes[0], pad_len, endpoint=False)
+                    closes = np.concatenate([interp, np.array(raw_closes, dtype=float)])
+
+                if len(raw_vols) >= n_days:
+                    volumes = np.array(raw_vols[-n_days:], dtype=float)
+                else:
+                    avg_v = float(np.mean(raw_vols)) if raw_vols else float(it["total_volume"])
+                    pad_v = np.full(n_days - len(raw_vols), avg_v)
+                    volumes = np.concatenate([pad_v, np.array(raw_vols, dtype=float)])
 
                 close_matrix[:, idx] = closes
                 volume_matrix[:, idx] = volumes
-                open_matrix[:, idx] = closes  # approximation if open not separated
-                high_matrix[:, idx] = [c * 1.01 for c in closes]
-                low_matrix[:, idx] = [c * 0.99 for c in closes]
+                open_matrix[:, idx] = closes
+                high_matrix[:, idx] = closes * 1.01
+                low_matrix[:, idx] = closes * 0.99
 
                 fund_records.append({
                     "symbol": sym,

@@ -42,9 +42,10 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0" 2>/dev/null || true
 
-      - name: 5. Install NPM Dependencies
+      - name: 5. Install NPM Dependencies & Capacitor Android
         run: |
           npm install --legacy-peer-deps
+          npm install --no-save --legacy-peer-deps @capacitor/core@8 @capacitor/cli@8 @capacitor/android@8
 
       - name: 6. Build Web Assets (Vite)
         run: |

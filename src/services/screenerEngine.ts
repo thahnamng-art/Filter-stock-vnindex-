@@ -1,11 +1,12 @@
-import { StockData, AnyFilterRule, MaType, MaOperator, McdxComponent, McdxOperator, VolumeOperator } from '../types/screener';
+import { StockData, AnyFilterRule, MaType } from '../types/screener';
 
 const TOTAL_SESSION_MINUTES = 270;
 
 // Wilder's RSI calculation on a price series
 export function calculateRSI(prices: number[], period: number = 14): number[] {
-  const rsi: number[] = new Array(prices.length).fill(50);
-  if (prices.length <= period) return rsi;
+  const len = prices.length;
+  const rsi: number[] = new Array(len).fill(50);
+  if (len <= period) return rsi;
 
   let gains = 0;
   let losses = 0;
@@ -13,31 +14,73 @@ export function calculateRSI(prices: number[], period: number = 14): number[] {
   for (let i = 1; i <= period; i++) {
     const diff = prices[i] - prices[i - 1];
     if (diff >= 0) gains += diff;
-    else losses += Math.abs(diff);
+    else losses -= diff;
   }
 
   let avgGain = gains / period;
   let avgLoss = losses / period;
 
   let rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-  rsi[period] = Math.round((100 - (100 / (1 + rs))) * 100) / 100;
+  rsi[period] = Math.round((100 - 100 / (1 + rs)) * 100) / 100;
 
-  for (let i = period + 1; i < prices.length; i++) {
+  for (let i = period + 1; i < len; i++) {
     const diff = prices[i] - prices[i - 1];
     const gain = diff > 0 ? diff : 0;
-    const loss = diff < 0 ? Math.abs(diff) : 0;
+    const loss = diff < 0 ? -diff : 0;
 
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
 
     rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-    rsi[i] = Math.round((100 - (100 / (1 + rs))) * 100) / 100;
+    rsi[i] = Math.round((100 - 100 / (1 + rs)) * 100) / 100;
   }
 
   return rsi;
 }
 
-// Calculate SMA or EMA series
+// Fast computation of last two MA values (current & previous bar)
+export function calculateLastTwoMA(
+  prices: number[],
+  period: number,
+  maType: MaType
+): { currMA: number; prevMA: number } {
+  const len = prices.length;
+  if (len === 0) return { currMA: 0, prevMA: 0 };
+
+  if (maType === 'SMA') {
+    const p = Math.min(period, len);
+    let sumCurr = 0;
+    for (let i = len - p; i < len; i++) {
+      sumCurr += prices[i];
+    }
+    const currMA = Math.round((sumCurr / p) * 100) / 100;
+
+    if (len < 2) return { currMA, prevMA: currMA };
+    const pPrev = Math.min(period, len - 1);
+    let sumPrev = 0;
+    for (let i = len - 1 - pPrev; i < len - 1; i++) {
+      sumPrev += prices[i];
+    }
+    const prevMA = Math.round((sumPrev / pPrev) * 100) / 100;
+    return { currMA, prevMA };
+  } else {
+    // EMA on tail window (min 3x period for convergence)
+    const startIdx = Math.max(0, len - period * 3);
+    const k = 2 / (period + 1);
+    let ema = prices[startIdx];
+    let prevEma = ema;
+    for (let i = startIdx + 1; i < len; i++) {
+      prevEma = ema;
+      ema = prices[i] * k + ema * (1 - k);
+    }
+    return {
+      currMA: Math.round(ema * 100) / 100,
+      prevMA: Math.round(prevEma * 100) / 100
+    };
+  }
+}
+
+// Calculate SMA or EMA series (kept for external compatibility)
 export function calculateMA(prices: number[], period: number, maType: MaType): number[] {
   const ma: number[] = new Array(prices.length).fill(0);
   if (prices.length === 0) return ma;
@@ -54,7 +97,6 @@ export function calculateMA(prices: number[], period: number, maType: MaType): n
       }
     }
   } else {
-    // EMA
     const k = 2 / (period + 1);
     ma[0] = prices[0];
     for (let i = 1; i < prices.length; i++) {
@@ -67,10 +109,11 @@ export function calculateMA(prices: number[], period: number, maType: MaType): n
 
 // Compute MCDX breakdown for a stock
 export function computeMcdxValues(prices: number[], periodBanker: number = 50, baseBanker: number = 50.0) {
-  const rsiBanker = calculateRSI(prices, periodBanker);
-  const rsiHot = calculateRSI(prices, 40);
+  const windowPrices = prices.length > 110 ? prices.slice(-110) : prices;
+  const rsiBanker = calculateRSI(windowPrices, periodBanker);
+  const rsiHot = calculateRSI(windowPrices, 40);
 
-  const len = prices.length;
+  const len = windowPrices.length;
   const currRsiBanker = rsiBanker[len - 1] || 50;
   const prevRsiBanker = rsiBanker[len - 2] || 50;
 
@@ -101,77 +144,93 @@ export function computeMcdxValues(prices: number[], periodBanker: number = 50, b
   };
 }
 
-// Calculate Market RS Percentile Rank (1 to 99) for all stocks
+// Calculate Market RS Percentile Rank (1 to 99) for all 1,626 stocks
 export function computeMarketRsRankings(stocks: StockData[], periodDays: number): Map<string, number> {
-  const returns: { symbol: string; ret: number }[] = [];
+  const returns: { symbol: string; ret: number }[] = new Array(stocks.length);
 
-  for (const s of stocks) {
+  for (let i = 0; i < stocks.length; i++) {
+    const s = stocks[i];
     const closes = s.historical_closes;
     const len = closes.length;
     const lookback = Math.min(len - 1, periodDays);
     const currPrice = closes[len - 1];
     const pastPrice = closes[len - 1 - lookback] || currPrice;
     const ret = pastPrice > 0 ? (currPrice - pastPrice) / pastPrice : 0;
-    returns.push({ symbol: s.symbol, ret });
+    returns[i] = { symbol: s.symbol, ret };
   }
 
-  // Sort ascending by return to rank
   returns.sort((a, b) => a.ret - b.ret);
   const total = returns.length;
   const rankMap = new Map<string, number>();
 
-  returns.forEach((item, index) => {
-    // Percentile rank 1 to 99
-    const rank = Math.round(((index + 1) / total) * 98 + 1);
-    rankMap.set(item.symbol, Math.min(99, Math.max(1, rank)));
-  });
+  for (let idx = 0; idx < total; idx++) {
+    const rank = Math.round(((idx + 1) / total) * 98 + 1);
+    rankMap.set(returns[idx].symbol, Math.min(99, Math.max(1, rank)));
+  }
 
   return rankMap;
 }
 
-// Full screener calculation pass on stocks
+// Full vectorized-style screener pass on all 1,626 stocks
 export function evaluateScreener(
   stocks: StockData[],
   rules: AnyFilterRule[],
   sessionMinutes: number = 180
 ): StockData[] {
-  // Pre-calculate RS rankings for 52w (260 bars) and 1m (21 bars)
-  const rs52Map = computeMarketRsRankings(stocks, 260);
-  const rs1mMap = computeMarketRsRankings(stocks, 21);
+  const rsCache = new Map<number, Map<string, number>>();
+  const getRsMap = (days: number) => {
+    let m = rsCache.get(days);
+    if (!m) {
+      m = computeMarketRsRankings(stocks, days);
+      rsCache.set(days, m);
+    }
+    return m;
+  };
 
-  // Filter rules that are active (enabled = true)
-  const activeRules = rules.filter(r => r.enabled);
+  const rs52Map = getRsMap(260);
+  const rs1mMap = getRsMap(21);
 
-  return stocks.map(stock => {
+  const activeRules = rules.filter((r) => r.enabled);
+  const sessionRatio = sessionMinutes / TOTAL_SESSION_MINUTES;
+
+  return stocks.map((stock) => {
     const closes = stock.historical_closes;
     const volumes = stock.historical_volumes;
     const len = closes.length;
-    const currClose = closes[len - 1];
-    const prevClose = closes[len - 2] || currClose;
+    const vLen = volumes.length;
 
-    // Technical calculations
     const rs52 = rs52Map.get(stock.symbol) || 50;
     const rs1m = rs1mMap.get(stock.symbol) || 50;
-    const rsiSeries = calculateRSI(closes, 14);
-    const rsi14 = rsiSeries[len - 1];
+
+    // Fast RSI(14) on recent 45 bars
+    const rsiSlice = len > 45 ? closes.slice(-45) : closes;
+    const rsiSeries = calculateRSI(rsiSlice, 14);
+    const rsi14 = rsiSeries[rsiSeries.length - 1];
+
     const mcdx = computeMcdxValues(closes, 50, 50);
 
-    const ma50Series = calculateMA(closes, 50, 'SMA');
-    const ma200Series = calculateMA(closes, 200, 'SMA');
-    const ma50 = ma50Series[len - 1];
-    const ma200 = ma200Series[len - 1];
+    const { currMA: ma50 } = calculateLastTwoMA(closes, 50, 'SMA');
+    const { currMA: ma200 } = calculateLastTwoMA(closes, 200, 'SMA');
 
-    // Volume spike estimation
+    // Volume spike estimation (default 10-day lookback)
     const lookbackDays = 10;
-    const histVols = volumes.slice(Math.max(0, len - 1 - lookbackDays), len - 1);
-    const avgDailyVol = histVols.length > 0 ? histVols.reduce((a, b) => a + b, 0) / histVols.length : stock.total_volume;
-    const expectedIntradayVol = avgDailyVol * (sessionMinutes / TOTAL_SESSION_MINUTES);
-    const volumeSpikeRatio = expectedIntradayVol > 0 ? Math.round((stock.total_volume / expectedIntradayVol) * 100) : 100;
+    const startVolIdx = Math.max(0, vLen - 1 - lookbackDays);
+    let volSum = 0;
+    let volCount = 0;
+    for (let i = startVolIdx; i < vLen - 1; i++) {
+      volSum += volumes[i];
+      volCount++;
+    }
+    const avgDailyVol = volCount > 0 ? volSum / volCount : stock.total_volume;
+    const expectedIntradayVol = avgDailyVol * sessionRatio;
+    const volumeSpikeRatio =
+      expectedIntradayVol > 0 ? Math.round((stock.total_volume / expectedIntradayVol) * 100) : 100;
 
     let passedCount = 0;
     let isMatched = true;
 
-    for (const rule of activeRules) {
+    for (let rIdx = 0; rIdx < activeRules.length; rIdx++) {
+      const rule = activeRules[rIdx];
       let passedThisRule = false;
 
       switch (rule.rule_type) {
@@ -193,7 +252,8 @@ export function evaluateScreener(
         }
         case 'RS': {
           const days = rule.period_type === 'WEEKS' ? rule.period_length * 5 : rule.period_length * 21;
-          const score = days >= 200 ? rs52 : rs1m;
+          const customMap = getRsMap(days);
+          const score = customMap.get(stock.symbol) || 50;
           passedThisRule = score >= rule.min_percentile && score <= rule.max_percentile;
           break;
         }
@@ -201,6 +261,8 @@ export function evaluateScreener(
           let testPrices = closes;
           if (rule.timeframe === '1W') {
             testPrices = closes.filter((_, idx) => idx % 5 === 0);
+          } else if (closes.length > rule.period * 3 + 10) {
+            testPrices = closes.slice(-(rule.period * 3 + 10));
           }
           const dynamicRsiSeries = calculateRSI(testPrices, rule.period);
           const currentRsi = dynamicRsiSeries[dynamicRsiSeries.length - 1];
@@ -212,12 +274,10 @@ export function evaluateScreener(
           if (rule.timeframe === '1W') {
             testPrices = closes.filter((_, idx) => idx % 5 === 0);
           }
-          const maSeries = calculateMA(testPrices, rule.period, rule.ma_type);
           const tLen = testPrices.length;
           const cP = testPrices[tLen - 1];
           const pP = testPrices[tLen - 2] || cP;
-          const cMA = maSeries[tLen - 1];
-          const pMA = maSeries[tLen - 2] || cMA;
+          const { currMA: cMA, prevMA: pMA } = calculateLastTwoMA(testPrices, rule.period, rule.ma_type);
 
           if (rule.operator === '>') passedThisRule = cP > cMA;
           else if (rule.operator === '>=') passedThisRule = cP >= cMA;
@@ -228,15 +288,20 @@ export function evaluateScreener(
           break;
         }
         case 'MCDX': {
-          let compVal = mcdx.banker;
-          let prevCompVal = mcdx.prevBanker;
+          const customMcdx =
+            rule.period_banker === 50 && rule.base_banker === 50
+              ? mcdx
+              : computeMcdxValues(closes, rule.period_banker || 50, rule.base_banker || 50);
+
+          let compVal = customMcdx.banker;
+          let prevCompVal = customMcdx.prevBanker;
 
           if (rule.component === 'HOT_MONEY') {
-            compVal = mcdx.hotMoney;
-            prevCompVal = mcdx.prevHot;
+            compVal = customMcdx.hotMoney;
+            prevCompVal = customMcdx.prevHot;
           } else if (rule.component === 'RETAILER') {
-            compVal = mcdx.retailer;
-            prevCompVal = mcdx.prevRetailer;
+            compVal = customMcdx.retailer;
+            prevCompVal = customMcdx.prevRetailer;
           }
 
           let compPassed = false;
@@ -245,16 +310,22 @@ export function evaluateScreener(
           else if (rule.operator === '<=') compPassed = compVal <= rule.threshold;
 
           if (rule.require_rising) {
-            compPassed = compPassed && (compVal > prevCompVal);
+            compPassed = compPassed && compVal > prevCompVal;
           }
           passedThisRule = compPassed;
           break;
         }
         case 'VOLUME_SPIKE': {
           const ruleLookback = rule.lookback_days || 10;
-          const pastVols = volumes.slice(Math.max(0, len - 1 - ruleLookback), len - 1);
-          const avgVol = pastVols.length > 0 ? pastVols.reduce((a, b) => a + b, 0) / pastVols.length : stock.total_volume;
-          const expectedVol = avgVol * (sessionMinutes / TOTAL_SESSION_MINUTES);
+          const sIdx = Math.max(0, vLen - 1 - ruleLookback);
+          let sumV = 0;
+          let cntV = 0;
+          for (let i = sIdx; i < vLen - 1; i++) {
+            sumV += volumes[i];
+            cntV++;
+          }
+          const avgVol = cntV > 0 ? sumV / cntV : stock.total_volume;
+          const expectedVol = avgVol * sessionRatio;
           const ratio = expectedVol > 0 ? (stock.total_volume / expectedVol) * 100 : 100;
 
           if (rule.operator === '>') {

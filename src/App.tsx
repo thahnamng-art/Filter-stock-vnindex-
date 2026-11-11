@@ -1,25 +1,26 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Plus, 
   RotateCcw, 
   Bookmark, 
-  Layers, 
   Code2, 
   Smartphone, 
   Monitor, 
-  Play, 
-  Pause, 
-  TrendingUp, 
   Sparkles,
   SlidersHorizontal,
   TableProperties,
-  Info,
   RefreshCw,
   CheckCircle2,
   Github
 } from 'lucide-react';
-import { AnyFilterRule, StockData, ScreenerPreset } from './types/screener';
-import { initializeVietnamStockUniverse, syncRealMarketDataFromVNDirect } from './data/mockVietnamStocks';
+import { AnyFilterRule, StockData, ScreenerPreset, ExchangeType } from './types/screener';
+import {
+  initializeVietnamStockUniverse,
+  syncRealMarketDataFromVNDirect,
+  getExchangeBreakdown,
+  SyncScopeMode,
+  SyncBatchProgress
+} from './data/mockVietnamStocks';
 import { evaluateScreener } from './services/screenerEngine';
 import { FilterCard } from './components/FilterCard';
 import { EditRuleModal } from './components/EditRuleModal';
@@ -28,24 +29,25 @@ import { PresetManagerModal } from './components/PresetManagerModal';
 import { StockDetailModal } from './components/StockDetailModal';
 import { PythonInspectorModal } from './components/PythonInspectorModal';
 import { GithubPublishModal } from './components/GithubPublishModal';
+import { SyncInspectorModal } from './components/SyncInspectorModal';
 import { ScreenerTable } from './components/ScreenerTable';
 
-// Default initial rules
+// Default initial rules across all 3 exchanges (HOSE, HNX, UPCOM)
 const INITIAL_RULES: AnyFilterRule[] = [
   {
     id: 'r_exchange',
     rule_type: 'EXCHANGE',
     name: 'Sàn giao dịch',
     enabled: true,
-    exchanges: ['HOSE', 'HNX']
+    exchanges: ['HOSE', 'HNX', 'UPCOM']
   },
   {
     id: 'r_value',
     rule_type: 'VALUE',
     name: 'Giá trị giao dịch',
     enabled: true,
-    min_value: 15.0,
-    max_value: 1000.0
+    min_value: 5.0,
+    max_value: 2000.0
   },
   {
     id: 'r_rs52w',
@@ -103,10 +105,12 @@ const INITIAL_RULES: AnyFilterRule[] = [
 const PRESETS_STORAGE_KEY = 'fialda_quant_presets_v1';
 
 export default function App() {
-  // Universe state
+  // Universe state (1,626 stocks across HOSE, HNX, UPCOM)
   const [stocks, setStocks] = useState<StockData[]>(() => initializeVietnamStockUniverse());
   const [rules, setRules] = useState<AnyFilterRule[]>(INITIAL_RULES);
   const [activePresetId, setActivePresetId] = useState<string | null>('preset_banker_breakout');
+
+  const universeStats = useMemo(() => getExchangeBreakdown(stocks), [stocks]);
 
   // Presets list
   const [presets, setPresets] = useState<ScreenerPreset[]>([
@@ -118,14 +122,23 @@ export default function App() {
       rules: INITIAL_RULES
     },
     {
+      id: 'preset_all_market',
+      name: 'Toàn thị trường (1,626 mã)',
+      description: 'Hiển thị toàn bộ 1,626 cổ phiếu trên cả 3 sàn HOSE, HNX, UPCoM',
+      isCustom: false,
+      rules: [
+        { id: 'pall_ex', rule_type: 'EXCHANGE', name: 'Sàn giao dịch', enabled: true, exchanges: ['HOSE', 'HNX', 'UPCOM'] }
+      ]
+    },
+    {
       id: 'preset_trend_ma200',
       name: 'Vượt MA200 & RS Top 15%',
       description: 'Cổ phiếu uptrend dài hạn, Giá > SMA200, Giá > SMA50, RS52w >= 85',
       isCustom: false,
       rules: [
         { id: 'p2_ex', rule_type: 'EXCHANGE', name: 'Sàn giao dịch', enabled: true, exchanges: ['HOSE', 'HNX', 'UPCOM'] },
-        { id: 'p2_val', rule_type: 'VALUE', name: 'Giá trị GD', enabled: true, min_value: 20, max_value: 1000 },
-        { id: 'p2_eps', rule_type: 'EPS', name: 'Chỉ số EPS (TTM)', enabled: true, min_eps: 2000, max_eps: 50000 },
+        { id: 'p2_val', rule_type: 'VALUE', name: 'Giá trị GD', enabled: true, min_value: 10, max_value: 2000 },
+        { id: 'p2_eps', rule_type: 'EPS', name: 'Chỉ số EPS (TTM)', enabled: true, min_eps: 1500, max_eps: 50000 },
         { id: 'p2_ma200', rule_type: 'PRICE_VS_MA', name: 'Giá trên SMA200', enabled: true, ma_type: 'SMA', period: 200, operator: '>', timeframe: '1D' },
         { id: 'p2_ma50', rule_type: 'PRICE_VS_MA', name: 'Giá trên SMA50', enabled: true, ma_type: 'SMA', period: 50, operator: '>', timeframe: '1D' },
         { id: 'p2_rs', rule_type: 'RS', name: 'Sức mạnh RS 52w', enabled: true, period_type: 'WEEKS', period_length: 52, min_percentile: 85, max_percentile: 99 }
@@ -137,9 +150,9 @@ export default function App() {
       description: 'RSI 14 về vùng 30 - 45, EPS cao và thanh khoản dồi dào',
       isCustom: false,
       rules: [
-        { id: 'p3_ex', rule_type: 'EXCHANGE', name: 'Sàn giao dịch', enabled: true, exchanges: ['HOSE', 'HNX'] },
-        { id: 'p3_val', rule_type: 'VALUE', name: 'Giá trị GD', enabled: true, min_value: 15, max_value: 1000 },
-        { id: 'p3_eps', rule_type: 'EPS', name: 'Chỉ số EPS (TTM)', enabled: true, min_eps: 1500, max_eps: 50000 },
+        { id: 'p3_ex', rule_type: 'EXCHANGE', name: 'Sàn giao dịch', enabled: true, exchanges: ['HOSE', 'HNX', 'UPCOM'] },
+        { id: 'p3_val', rule_type: 'VALUE', name: 'Giá trị GD', enabled: true, min_value: 5, max_value: 2000 },
+        { id: 'p3_eps', rule_type: 'EPS', name: 'Chỉ số EPS (TTM)', enabled: true, min_eps: 1000, max_eps: 50000 },
         { id: 'p3_rsi', rule_type: 'RSI', name: 'RSI 14 ngày', enabled: true, period: 14, timeframe: '1D', min_rsi: 30, max_rsi: 45 }
       ]
     }
@@ -150,28 +163,73 @@ export default function App() {
   const [viewMode, setViewMode] = useState<'MOBILE' | 'DESKTOP'>('MOBILE');
 
   // Realtime 5s timer states
-  const [isAutoRefresh, setIsAutoRefresh] = useState(true);
+  const [isAutoRefresh] = useState(true);
   const [countdown, setCountdown] = useState(5);
-  const [sessionMinutes, setSessionMinutes] = useState(165); // 165 phút trong phiên
-  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
+  const [sessionMinutes] = useState(165); // 165 phút trong phiên
+  const [, setLastUpdated] = useState<Date>(new Date());
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
-  // Live real data sync from VNDirect
-  const handleSyncRealData = async () => {
+  // Sync Inspector Modal & Batch Controls
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [syncMode, setSyncMode] = useState<SyncScopeMode>('FULL_1626');
+  const [syncExchanges, setSyncExchanges] = useState<ExchangeType[]>(['HOSE', 'HNX', 'UPCOM']);
+  const [batchProgress, setBatchProgress] = useState<SyncBatchProgress | null>(null);
+  const [lastSyncDate, setLastSyncDate] = useState<string>('2026-11-10');
+  const abortSyncRef = useRef<boolean>(false);
+
+  const handleToggleSyncExchange = (ex: ExchangeType) => {
+    setSyncExchanges((prev) => {
+      if (prev.includes(ex)) {
+        return prev.length > 1 ? prev.filter((item) => item !== ex) : prev;
+      }
+      return [...prev, ex];
+    });
+  };
+
+  // Live real data sync from VNDirect across all 1,626 stocks
+  const handleStartBatchSync = async () => {
+    abortSyncRef.current = false;
     setIsSyncing(true);
-    setSyncStatusMsg('Đang kéo dữ liệu OHLCV 260 nến thực tế từ VNDirect...');
+    setSyncStatusMsg(
+      `Đang kết nối VNDirect đồng bộ ${stocks.length.toLocaleString()} mã CP (HOSE, HNX, UPCoM)...`
+    );
     try {
-      const res = await syncRealMarketDataFromVNDirect(stocks);
+      const res = await syncRealMarketDataFromVNDirect(stocks, {
+        mode: syncMode,
+        targetExchanges: syncExchanges,
+        batchSize: 45,
+        timeoutMs: 3200,
+        shouldAbort: () => abortSyncRef.current,
+        onBatchProgress: (prog) => {
+          setBatchProgress(prog);
+          const pct = Math.round((prog.processed / Math.max(1, prog.totalTarget)) * 100);
+          setSyncStatusMsg(
+            `Đang đồng bộ Lô ${prog.batchIndex}/${prog.totalBatches}: ${prog.processed.toLocaleString()}/${prog.totalTarget.toLocaleString()} mã (${pct}%) — HTTP Live: ${prog.liveUpdatedCount}`
+          );
+        }
+      });
       setStocks(res.stocks);
-      setSyncStatusMsg(`Đã đồng bộ thành công ${res.successCount} mã CP thực tế (Phiên ${res.lastDate})`);
-      setTimeout(() => setSyncStatusMsg(null), 4000);
+      setLastSyncDate(res.lastDate);
+      setSyncStatusMsg(
+        `Đã đồng bộ ${res.successCount.toLocaleString()} mã CP (HOSE: ${res.breakdown.HOSE} · HNX: ${res.breakdown.HNX} · UPCoM: ${res.breakdown.UPCOM} · HTTP Live: ${res.liveHttpCount} — Phiên ${res.lastDate})`
+      );
+      setTimeout(() => setSyncStatusMsg(null), 7000);
     } catch (err: any) {
       setSyncStatusMsg('Lỗi đồng bộ: ' + err.message);
       setTimeout(() => setSyncStatusMsg(null), 4000);
     } finally {
       setIsSyncing(false);
     }
+  };
+
+  const handleAbortSync = () => {
+    abortSyncRef.current = true;
+  };
+
+  // Open Sync Rules & Progress Inspector Modal
+  const handleOpenSyncInspector = () => {
+    setIsSyncModalOpen(true);
   };
 
   // Modals
@@ -230,30 +288,32 @@ export default function App() {
     }
   };
 
-  // Background 5-second tick simulator
+  // Background 5-second tick simulator on active stocks
   useEffect(() => {
     if (!isAutoRefresh) return;
 
     const timer = setInterval(() => {
       setCountdown((prev) => {
         if (prev <= 1) {
-          // Trigger 5-second tick update on stock universe
           setStocks((prevStocks) => {
-            return prevStocks.map((stock) => {
-              // Micro fluctuation
-              const delta = (Math.random() - 0.48) * 0.15;
-              const newPrice = Math.max(1.0, Math.round((stock.price + delta) * 100) / 100);
-              const volAdd = Math.floor(Math.random() * 20000 + 1000);
+            return prevStocks.map((stock, idx) => {
+              // Tick top 350 liquid stocks + random 25% of remaining universe every 5s
+              if (idx > 350 && Math.random() > 0.25) return stock;
+
+              const delta = (Math.random() - 0.48) * 0.12;
+              const newPrice = Math.max(0.5, Math.round((stock.price + delta) * 100) / 100);
+              const volAdd = Math.floor(Math.random() * 12000 + 500);
               const newVol = stock.total_volume + volAdd;
               const newVal = Math.round((stock.total_value + (volAdd * newPrice * 1000) / 1e9) * 10) / 10;
-              const closes = [...stock.historical_closes];
+
+              const closes = stock.historical_closes.slice();
               closes[closes.length - 1] = newPrice;
-              const volumes = [...stock.historical_volumes];
+              const volumes = stock.historical_volumes.slice();
               volumes[volumes.length - 1] = newVol;
 
               const prevClose = closes[closes.length - 2] || newPrice;
               const change = Math.round((newPrice - prevClose) * 100) / 100;
-              const change_pct = Math.round((change / prevClose) * 10000) / 100;
+              const change_pct = prevClose > 0 ? Math.round((change / prevClose) * 10000) / 100 : 0;
 
               return {
                 ...stock,
@@ -278,7 +338,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isAutoRefresh]);
 
-  // Execute quantitative calculation engine on RAM matrix
+  // Execute quantitative calculation engine on RAM matrix (1,626 stocks)
   const evaluatedStocks = useMemo(() => {
     return evaluateScreener(stocks, rules, sessionMinutes);
   }, [stocks, rules, sessionMinutes]);
@@ -354,20 +414,21 @@ export default function App() {
           <span className="hidden sm:inline-flex items-center gap-1.5 text-[11px] font-mono-numbers text-slate-400 bg-[#161f2e] border border-slate-800 px-2.5 py-0.5 rounded-full">
             <span>VN-Index:</span>
             <strong className="text-emerald-400">1,743.07 (+28.75 pt, +1.68%)</strong>
-            <span className="text-[10px] text-purple-400 font-sans border-l border-slate-700 pl-1.5">● Data Thực Tế</span>
+            <span className="text-[10px] text-purple-400 font-sans border-l border-slate-700 pl-1.5">
+              ● {universeStats.total.toLocaleString()} mã (HOSE {universeStats.HOSE} · HNX {universeStats.HNX} · UPCoM {universeStats.UPCOM})
+            </span>
           </span>
         </div>
 
         {/* Zone 2: Navigation / Controls */}
         <div className="hidden lg:flex items-center gap-4 text-xs font-medium text-slate-300">
           <button
-            onClick={handleSyncRealData}
-            disabled={isSyncing}
+            onClick={handleOpenSyncInspector}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#141b27] hover:bg-[#1c2637] text-purple-300 hover:text-white border border-purple-900/40 transition-colors shadow-sm"
-            title="Đồng bộ 260 nến OHLCV mới nhất từ VNDirect"
+            title="Xem Quy tắc cập nhật & Đồng bộ toàn bộ 1,626 mã CP từ VNDirect"
           >
             <RefreshCw className={`w-3.5 h-3.5 text-purple-400 ${isSyncing ? 'animate-spin' : ''}`} />
-            <span>{isSyncing ? 'Đang đồng bộ...' : 'Đồng bộ Dữ liệu Thực tế'}</span>
+            <span>{isSyncing ? 'Đang đồng bộ...' : `Quy tắc & Đồng bộ (${universeStats.total.toLocaleString()} Mã)`}</span>
           </button>
           <div className="flex items-center gap-2 font-mono-numbers text-[11px] text-slate-400">
             <span className={`w-2 h-2 rounded-full ${isAutoRefresh ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
@@ -430,9 +491,16 @@ export default function App() {
 
       {/* Sync Status Banner */}
       {syncStatusMsg && (
-        <div className="bg-purple-950/80 border-b border-purple-800 text-purple-200 px-4 py-1.5 text-xs flex items-center justify-center gap-2 animate-in fade-in">
-          <CheckCircle2 className="w-3.5 h-3.5 text-purple-300" />
+        <div className="bg-purple-950/80 border-b border-purple-800 text-purple-200 px-4 py-1.5 text-xs flex items-center justify-center gap-3 animate-in fade-in">
+          <CheckCircle2 className="w-3.5 h-3.5 text-purple-300 shrink-0" />
           <span>{syncStatusMsg}</span>
+          <button
+            type="button"
+            onClick={handleOpenSyncInspector}
+            className="underline text-purple-300 hover:text-white font-semibold whitespace-nowrap shrink-0"
+          >
+            Chi tiết quy tắc
+          </button>
         </div>
       )}
 
@@ -449,18 +517,16 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <h2 className="text-sm font-bold text-slate-100">Bộ Lọc Cổ Phiếu</h2>
                   <span className="text-[10px] font-mono-numbers px-1.5 py-0.2 rounded bg-purple-950/60 text-purple-300 border border-purple-800/40">
-                    {matchedStocks.length} CP
+                    {matchedStocks.length.toLocaleString()} / {universeStats.total.toLocaleString()} CP
                   </span>
                 </div>
-                <div className="flex items-center gap-2 text-[10px] text-slate-400 mt-0.5">
-                  <span className="flex items-center gap-1">
+                <div className="flex items-center gap-1.5 text-[10px] text-slate-400 mt-0.5 font-mono-numbers">
+                  <span className="flex items-center gap-1 text-slate-300">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    HOSE · HNX · UPCOM
+                    HOSE {universeStats.HOSE} · HNX {universeStats.HNX} · UPCoM {universeStats.UPCOM}
                   </span>
                   <span>·</span>
-                  <span className="text-purple-300 font-semibold">Dữ liệu thật 10/11</span>
-                  <span>·</span>
-                  <span className="font-mono-numbers text-slate-400">5s ({countdown}s)</span>
+                  <span className="text-purple-300 font-semibold font-sans">5s ({countdown}s)</span>
                 </div>
               </div>
 
@@ -473,12 +539,12 @@ export default function App() {
                   <Github className="w-3.5 h-3.5 text-purple-400" />
                 </button>
                 <button
-                  onClick={handleSyncRealData}
-                  disabled={isSyncing}
-                  className="w-7 h-7 rounded-lg flex items-center justify-center text-slate-400 hover:text-purple-300 hover:bg-[#1a2335] transition-colors"
-                  title="Đồng bộ dữ liệu thực"
+                  onClick={handleOpenSyncInspector}
+                  className="px-2 h-7 rounded-lg flex items-center gap-1 text-[10px] font-semibold text-purple-300 bg-purple-950/40 border border-purple-800/50 hover:bg-purple-900/50 transition-colors"
+                  title="Xem Quy tắc cập nhật & Đồng bộ 1,626 mã dữ liệu thực"
                 >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-purple-400' : ''}`} />
+                  <RefreshCw className={`w-3 h-3 ${isSyncing ? 'animate-spin text-purple-400' : ''}`} />
+                  <span>Đồng bộ</span>
                 </button>
                 <button
                   onClick={() => setIsPresetModalOpen(true)}
@@ -499,7 +565,7 @@ export default function App() {
 
             {/* Preset Selector Chips Bar */}
             <div className="px-3 py-2 bg-[#090d14] border-b border-[#18202d] flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0">
-              {presets.slice(0, 4).map((p) => {
+              {presets.slice(0, 5).map((p) => {
                 const isActive = p.id === activePresetId;
                 return (
                   <button
@@ -564,6 +630,7 @@ export default function App() {
                 <div className="h-full flex flex-col">
                   <ScreenerTable
                     stocks={matchedStocks}
+                    totalUniverseCount={universeStats.total}
                     onSelectStock={(stock) => setSelectedStockDetail(stock)}
                   />
                 </div>
@@ -603,9 +670,11 @@ export default function App() {
                 }`}
               >
                 <TableProperties className="w-4 h-4" />
-                <span className="text-[10px] tracking-tight">Kết quả ({matchedStocks.length})</span>
+                <span className="text-[10px] tracking-tight">
+                  Kết quả ({matchedStocks.length.toLocaleString()} / {universeStats.total.toLocaleString()})
+                </span>
                 {matchedStocks.length > 0 && (
-                  <span className="absolute top-2 right-12 w-2 h-2 rounded-full bg-purple-500" />
+                  <span className="absolute top-2 right-6 w-2 h-2 rounded-full bg-purple-500" />
                 )}
               </button>
             </div>
@@ -622,7 +691,7 @@ export default function App() {
                 <div>
                   <h3 className="text-sm font-bold text-slate-100">Thiết lập Bộ lọc Động</h3>
                   <p className="text-[11px] text-slate-400 font-mono-numbers mt-0.5">
-                    {activeRulesCount} tiêu chí đang áp dụng
+                    {activeRulesCount} tiêu chí · Quét {universeStats.total.toLocaleString()} mã (HOSE {universeStats.HOSE}, HNX {universeStats.HNX}, UPCoM {universeStats.UPCOM})
                   </p>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -694,6 +763,7 @@ export default function App() {
             <div className="flex-1 flex flex-col bg-[#0c1017] overflow-hidden">
               <ScreenerTable
                 stocks={matchedStocks}
+                totalUniverseCount={universeStats.total}
                 onSelectStock={(stock) => setSelectedStockDetail(stock)}
               />
             </div>
@@ -757,6 +827,23 @@ export default function App() {
         <GithubPublishModal
           isOpen={true}
           onClose={() => setIsGithubModalOpen(false)}
+        />
+      )}
+
+      {isSyncModalOpen && (
+        <SyncInspectorModal
+          isOpen={true}
+          onClose={() => setIsSyncModalOpen(false)}
+          isSyncing={isSyncing}
+          syncMode={syncMode}
+          onChangeSyncMode={setSyncMode}
+          selectedExchanges={syncExchanges}
+          onToggleExchange={handleToggleSyncExchange}
+          onStartSync={handleStartBatchSync}
+          onAbortSync={handleAbortSync}
+          batchProgress={batchProgress}
+          universeBreakdown={universeStats}
+          lastSyncDate={lastSyncDate}
         />
       )}
     </div>
