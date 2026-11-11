@@ -164,7 +164,7 @@ export function buildOhlcvFromStock(stock: StockData): OhlcvCandle[] {
   return candles;
 }
 
-// Fetch live OHLCV candles from VNDirect dchart API (if reachable)
+// Fetch live OHLCV candles from VNDirect dchart API (direct or via CORS proxy for GitHub Pages)
 export async function fetchLiveOhlcvFromVNDirect(
   symbol: string,
   timeoutMs: number = 2800
@@ -176,54 +176,61 @@ export async function fetchLiveOhlcvFromVNDirect(
 
   const nowSec = Math.floor(Date.now() / 1000);
   const fromSec = nowSec - 86400 * 400; // ~260 trading sessions
-  const url = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
+  const directUrl = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
     upper
   )}&from=${fromSec}&to=${nowSec}`;
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const candidateUrls = [
+    directUrl,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`
+  ];
 
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= 25) {
-      const len = data.c.length;
-      const candles: OhlcvCandle[] = [];
-      let prevMonth = -1;
+  for (const url of candidateUrls) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-      for (let i = 0; i < len; i++) {
-        const ts = data.t[i];
-        const dt = new Date(ts * 1000);
-        const yyyy = dt.getFullYear();
-        const mm = String(dt.getMonth() + 1).padStart(2, '0');
-        const dd = String(dt.getDate()).padStart(2, '0');
-        const mNum = dt.getMonth() + 1;
-        let monthLabel: string | undefined;
-        if (mNum !== prevMonth) {
-          monthLabel = `Tháng ${mNum}`;
-          prevMonth = mNum;
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= 25) {
+        const len = data.c.length;
+        const candles: OhlcvCandle[] = [];
+        let prevMonth = -1;
+
+        for (let i = 0; i < len; i++) {
+          const ts = data.t[i];
+          const dt = new Date(ts * 1000);
+          const yyyy = dt.getFullYear();
+          const mm = String(dt.getMonth() + 1).padStart(2, '0');
+          const dd = String(dt.getDate()).padStart(2, '0');
+          const mNum = dt.getMonth() + 1;
+          let monthLabel: string | undefined;
+          if (mNum !== prevMonth) {
+            monthLabel = `Tháng ${mNum}`;
+            prevMonth = mNum;
+          }
+
+          candles.push({
+            timestamp: ts,
+            dateStr: `${yyyy}-${mm}-${dd}`,
+            shortDate: `${dd}/${mm}`,
+            monthLabel,
+            open: Number(data.o?.[i] ?? data.c[i]),
+            high: Number(data.h?.[i] ?? data.c[i]),
+            low: Number(data.l?.[i] ?? data.c[i]),
+            close: Number(data.c[i]),
+            volume: Number(data.v?.[i] ?? 100000)
+          });
         }
 
-        candles.push({
-          timestamp: ts,
-          dateStr: `${yyyy}-${mm}-${dd}`,
-          shortDate: `${dd}/${mm}`,
-          monthLabel,
-          open: Number(data.o?.[i] ?? data.c[i]),
-          high: Number(data.h?.[i] ?? data.c[i]),
-          low: Number(data.l?.[i] ?? data.c[i]),
-          close: Number(data.c[i]),
-          volume: Number(data.v?.[i] ?? 100000)
-        });
+        liveOhlcvCache.set(upper, candles);
+        return candles;
       }
-
-      liveOhlcvCache.set(upper, candles);
-      return candles;
+    } catch {
+      clearTimeout(timer);
     }
-  } catch {
-    clearTimeout(timer);
   }
   return null;
 }

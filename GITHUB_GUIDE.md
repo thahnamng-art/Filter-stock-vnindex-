@@ -1,52 +1,39 @@
-# Hướng dẫn Xuất bản GitHub & Tự động Build file APK (CI/CD)
+# Hướng dẫn Xuất bản Web Công khai (GitHub Pages) & Tự động Build APK
 
-Repository này đã được cấu hình sẵn toàn bộ mã nguồn, cấu hình Android Capacitor (`vn.fialda.quant.screener`), và workflow tự động hóa **GitHub Actions** (`.github/workflows/build-apk.yml`).
+Repository này đã được tích hợp sẵn **2 quy trình tự động hóa (GitHub Actions)**:
+1. **Tự động xuất bản Web công khai lên GitHub Pages** (`.github/workflows/deploy-pages.yml`)
+2. **Tự động biên dịch file cài đặt Android `.apk`** (`.github/workflows/build-apk.yml`)
 
 ---
 
-## 1. Các bước đẩy mã nguồn lên GitHub của bạn
+## 1. Cách đẩy code lên GitHub & Bật Web công khai (GitHub Pages)
 
-### Cách 1: Sử dụng script tự động có sẵn
-Chỉ cần mở Terminal và chạy lệnh sau (thay thế URL bằng link repo GitHub của bạn):
+### Bước 1: Đẩy code từ dự án lên kho GitHub của bạn
+Bạn có thể bấm biểu tượng **GitHub** trên thanh công cụ của AI Studio để đồng bộ, hoặc mở Terminal chạy lệnh:
 ```bash
 ./publish_to_github.sh https://github.com/<your-username>/<your-repo-name>.git
 ```
 
-### Cách 2: Thực hiện thủ công từng lệnh
-```bash
-# 1. Thêm địa chỉ remote GitHub của bạn
-git remote add origin https://github.com/<your-username>/<your-repo-name>.git
+### Bước 2: Bật chế độ GitHub Pages (Chỉ cần làm 1 lần duy nhất)
+1. Truy cập vào repository của bạn trên GitHub (`https://github.com/<your-username>/<your-repo-name>`).
+2. Bấm vào tab **Settings** (Cài đặt) ở thanh menu phía trên.
+3. Ở cột menu bên trái, chọn mục **Pages**.
+4. Tại phần **Build and deployment** -> mục **Source**, đổi từ `Deploy from a branch` sang **`GitHub Actions`**.
 
-# 2. Đẩy nhánh chính (main) lên GitHub
-git push -u origin main
-
-# 3. Tạo tag phiên bản và đẩy lên để kích hoạt tự động build file APK
-git tag -a v1.0.0 -m "Release v1.0.0 - VNStock Realtime Screener"
-git push origin v1.0.0
-```
-
----
-
-## 2. Quy trình Tự động tạo file APK (GitHub Actions)
-
-Mỗi khi bạn thực hiện một trong các thao tác sau:
-1. **Tạo Release mới trên GitHub** (Vào GitHub -> mục **Releases** -> **Draft a new release** -> Tạo tag `v1.0.0` -> **Publish release**).
-2. **Đẩy tag phiên bản qua git** (`git push origin v1.0.0`).
-3. **Kích hoạt thủ công**: Vào tab **Actions** trên GitHub -> Chọn workflow **Build & Release Android APK** -> Bấm **Run workflow**.
-
-Quy trình GitHub Actions (`.github/workflows/build-apk.yml`) sẽ tự động:
-- Khởi tạo môi trường Ubuntu với **Node.js 20**, **Java JDK 17**, và **Android SDK**.
-- Cài đặt thư viện và build gói web bundle Vite tối ưu.
-- Đồng bộ mã nguồn vào native Android project qua Capacitor.
-- Chạy Gradle `./gradlew assembleDebug` và `./gradlew assembleRelease` để biên dịch file `.apk`.
-- **Tự động đính kèm file APK** vào mục Releases trên GitHub để tải về:
-  - `fialda-quant-screener-v1.0.0-debug.apk`: **Cài đặt trực tiếp ngay lập tức** trên mọi điện thoại Android (bật cho phép cài từ nguồn ngoài).
-  - `fialda-quant-screener-v1.0.0-release-unsigned.apk`: Bản release sẵn sàng cho ký chứng chỉ Google Play.
+### Bước 3: Nhận link Web công khai
+* Ngay sau khi bật `GitHub Actions` (hoặc mỗi khi bạn đẩy code mới lên nhánh `main`), workflow **Deploy Web App to GitHub Pages** trong tab **Actions** sẽ tự động chạy (mất khoảng 45–60 giây).
+* Khi chạy xong, trang web của bạn sẽ hoạt động công khai vĩnh viễn tại địa chỉ:
+  ```text
+  https://<your-username>.github.io/<your-repo-name>/
+  ```
+* **Ưu điểm**: Ai có link đều truy cập được ngay trên máy tính & điện thoại, không cần đăng nhập Google và không có màn hình cảnh báo trung gian.
 
 ---
 
-## 3. Cấu trúc Android Project
-- **App ID**: `vn.fialda.quant.screener`
-- **Tên ứng dụng**: `Fialda Quant`
-- **Mã nguồn Android**: Nằm trong thư mục `/android`
-- **File cấu hình Capacitor**: `capacitor.config.ts`
+## 2. Quy trình Tự động tạo file APK Android (GitHub Actions)
+
+Mỗi khi bạn cần xuất file `.apk` cài đặt cho điện thoại Android:
+1. Vào tab **Actions** trên GitHub -> Chọn **Build & Release Android APK** -> Bấm **Run workflow** (hoặc đẩy tag phiên bản `git tag -fa v1.0.1 -m "Release" && git push origin v1.0.1 --force`).
+2. Hệ thống sẽ tự động đóng gói:
+   - `fialda-quant-screener-v1.0.x-debug.apk`: Cài đặt trực tiếp ngay trên mọi máy Android.
+   - `fialda-quant-screener-v1.0.x-release-unsigned.apk`: Bản release phục vụ ký chứng chỉ.
