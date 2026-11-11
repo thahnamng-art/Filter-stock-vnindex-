@@ -14,7 +14,7 @@ import {
   Github,
   CandlestickChart
 } from 'lucide-react';
-import { AnyFilterRule, StockData, ScreenerPreset, ExchangeType } from './types/screener';
+import { AnyFilterRule, StockData, ScreenerPreset, ExchangeType, getVietnamTodayDateStr } from './types/screener';
 import {
   initializeVietnamStockUniverse,
   syncRealMarketDataFromVNDirect,
@@ -23,6 +23,7 @@ import {
   SyncBatchProgress
 } from './data/mockVietnamStocks';
 import { evaluateScreener } from './services/screenerEngine';
+import { resolveStockOrMarketIndex } from './services/technicalChartService';
 import { FilterCard } from './components/FilterCard';
 import { EditRuleModal } from './components/EditRuleModal';
 import { AddRuleModal } from './components/AddRuleModal';
@@ -41,7 +42,7 @@ const INITIAL_RULES: AnyFilterRule[] = [
     rule_type: 'DATE_FILTER',
     name: 'Lọc theo Ngày & Biến động',
     enabled: true,
-    target_date: '2026-11-10',
+    target_date: getVietnamTodayDateStr(),
     offset_days: 0,
     lookback_days: 1,
     min_return_pct: -30.0,
@@ -191,7 +192,7 @@ export default function App() {
   const [syncMode, setSyncMode] = useState<SyncScopeMode>('FULL_1626');
   const [syncExchanges, setSyncExchanges] = useState<ExchangeType[]>(['HOSE', 'HNX', 'UPCOM']);
   const [batchProgress, setBatchProgress] = useState<SyncBatchProgress | null>(null);
-  const [lastSyncDate, setLastSyncDate] = useState<string>('2026-11-10');
+  const [lastSyncDate, setLastSyncDate] = useState<string>(() => getVietnamTodayDateStr());
   const abortSyncRef = useRef<boolean>(false);
 
   const handleToggleSyncExchange = (ex: ExchangeType) => {
@@ -366,6 +367,7 @@ export default function App() {
   const activeChartStock = useMemo(() => {
     return (
       evaluatedStocks.find((s) => s.symbol === chartSymbol) ||
+      resolveStockOrMarketIndex(chartSymbol, evaluatedStocks) ||
       matchedStocks[0] ||
       evaluatedStocks[0]
     );

@@ -1,6 +1,6 @@
 import React from 'react';
 import { X, TrendingUp, Activity, Layers, BarChart2, DollarSign, Database, Check, Calendar } from 'lucide-react';
-import { AnyFilterRule, RuleType } from '../types/screener';
+import { AnyFilterRule, RuleType, getVietnamTodayDateStr } from '../types/screener';
 
 interface AddRuleModalProps {
   isOpen: boolean;
@@ -30,14 +30,14 @@ export const AddRuleModal: React.FC<AddRuleModalProps> = ({
     {
       type: 'DATE_FILTER',
       title: 'Lọc theo Ngày giao dịch & Biến động phiên',
-      desc: 'Chọn ngày giao dịch cần lọc (Hôm nay hoặc Backtest quá khứ T-N) và lọc hiệu suất % thay đổi giá trong N phiên.',
+      desc: 'Chọn ngày giao dịch cần lọc (Hôm nay theo giờ VN hoặc Backtest quá khứ T-N) và lọc hiệu suất % thay đổi giá trong N phiên.',
       icon: <Calendar className="w-5 h-5 text-cyan-400" />,
       factory: (id) => ({
         id,
         rule_type: 'DATE_FILTER',
         name: 'Lọc theo Ngày & Biến động',
         enabled: true,
-        target_date: '2026-11-10',
+        target_date: getVietnamTodayDateStr(),
         offset_days: 0,
         lookback_days: 1,
         min_return_pct: -30,

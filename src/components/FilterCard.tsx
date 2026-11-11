@@ -11,7 +11,7 @@ import {
   ChevronRight,
   Calendar
 } from 'lucide-react';
-import { AnyFilterRule } from '../types/screener';
+import { AnyFilterRule, formatVnDateDisplay, getVietnamTodayDateStr } from '../types/screener';
 
 interface FilterCardProps {
   rule: AnyFilterRule;
@@ -59,10 +59,14 @@ export const FilterCard: React.FC<FilterCardProps> = ({
   const renderSummaryText = () => {
     switch (rule.rule_type) {
       case 'DATE_FILTER': {
+        const displayDate =
+          rule.offset_days === 0
+            ? formatVnDateDisplay(getVietnamTodayDateStr())
+            : formatVnDateDisplay(rule.target_date);
         const sessionLabel =
           rule.offset_days === 0
-            ? `Hôm nay (${rule.target_date})`
-            : `${rule.target_date} (Lùi T-${rule.offset_days})`;
+            ? `Hôm nay (${displayDate})`
+            : `${displayDate} (Lùi T-${rule.offset_days})`;
         return {
           title: 'Lọc theo Ngày & Biến động',
           desc: `${sessionLabel} · ${rule.lookback_days} phiên: ${rule.min_return_pct}% đến +${rule.max_return_pct}%`

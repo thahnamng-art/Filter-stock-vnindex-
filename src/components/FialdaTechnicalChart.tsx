@@ -34,7 +34,9 @@ import { StockData, TimeFrame } from '../types/screener';
 import {
   computeFullTechnicalChart,
   fetchLiveOhlcvFromVNDirect,
-  OhlcvCandle
+  OhlcvCandle,
+  MARKET_INDEX_STOCKS,
+  resolveStockOrMarketIndex
 } from '../services/technicalChartService';
 
 interface FialdaTechnicalChartProps {
@@ -216,31 +218,58 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
     return idx > 0 ? visiblePoints[idx - 1] : visiblePoints[0];
   }, [visiblePoints, hoverIndex]);
 
-  // Search matching across all 1,626 stocks
+  // Search matching across Market Indices (VNINDEX, VN30, HNXINDEX, UPCOMINDEX, VN30F1M, VN100, HNX30) + all 1,626 stocks
+  const combinedUniverse = useMemo(() => {
+    const existingSymbols = new Set(MARKET_INDEX_STOCKS.map((m) => m.symbol));
+    return [
+      ...MARKET_INDEX_STOCKS,
+      ...allStocks.filter((s) => !existingSymbols.has(s.symbol))
+    ];
+  }, [allStocks]);
+
   const searchResults = useMemo(() => {
     const q = searchQuery.trim().toUpperCase();
     if (!q) {
       const cdc = allStocks.find((s) => s.symbol === 'CDC');
-      const topList = allStocks.slice(0, 25);
-      if (cdc && !topList.some((s) => s.symbol === 'CDC')) {
-        return [cdc, ...topList];
+      const topStocks = allStocks.slice(0, 22);
+      const baseList = [...MARKET_INDEX_STOCKS];
+      if (cdc && !baseList.some((s) => s.symbol === 'CDC')) {
+        baseList.push(cdc);
       }
-      return topList;
+      for (const st of topStocks) {
+        if (!baseList.some((b) => b.symbol === st.symbol)) {
+          baseList.push(st);
+        }
+      }
+      return baseList;
     }
+
     const exactAndPrefix: StockData[] = [];
     const contains: StockData[] = [];
-    for (const s of allStocks) {
+
+    // Check if query matches an alias like HNX, UPCOM, VNI
+    const resolvedAlias = resolveStockOrMarketIndex(q, allStocks);
+    if (
+      resolvedAlias &&
+      MARKET_INDEX_STOCKS.some((idx) => idx.symbol === resolvedAlias.symbol)
+    ) {
+      exactAndPrefix.push(resolvedAlias);
+    }
+
+    for (const s of combinedUniverse) {
+      if (exactAndPrefix.some((item) => item.symbol === s.symbol)) continue;
       const sym = s.symbol.toUpperCase();
       const name = s.name.toUpperCase();
+      const ind = s.industry.toUpperCase();
       if (sym === q || sym.startsWith(q)) {
         exactAndPrefix.push(s);
-      } else if (sym.includes(q) || name.includes(q)) {
+      } else if (sym.includes(q) || name.includes(q) || ind.includes(q)) {
         contains.push(s);
       }
-      if (exactAndPrefix.length + contains.length >= 40) break;
+      if (exactAndPrefix.length + contains.length >= 45) break;
     }
-    return [...exactAndPrefix, ...contains].slice(0, 30);
-  }, [allStocks, searchQuery]);
+    return [...exactAndPrefix, ...contains].slice(0, 35);
+  }, [combinedUniverse, allStocks, searchQuery]);
 
   const handleSelectSymbolFromSearch = (stock: StockData) => {
     onSelectStock(stock);
@@ -253,6 +282,11 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
       e.preventDefault();
       if (searchResults.length > 0) {
         handleSelectSymbolFromSearch(searchResults[0]);
+      } else if (searchQuery.trim()) {
+        const customStock = resolveStockOrMarketIndex(searchQuery, allStocks);
+        if (customStock) {
+          handleSelectSymbolFromSearch(customStock);
+        }
       }
     } else if (e.key === 'Escape') {
       setIsSearchOpen(false);
@@ -980,7 +1014,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={handleSearchKeyDown}
-                placeholder="Nhập mã CP (VD: CDC, FPT, HPG, SSI, VCB...) hoặc tên công ty"
+                placeholder="Nhập chỉ số (VNINDEX, VN30, HNXINDEX...) hoặc mã CP (CDC, FPT, HPG...)"
                 className="flex-1 bg-transparent text-xs text-white placeholder:text-slate-500 focus:outline-none uppercase"
               />
               {searchQuery && (
@@ -1001,9 +1035,30 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
               </button>
             </div>
 
+            {/* Market Indices Quick Bar (VNINDEX, VN30, HNXINDEX, UPCOMINDEX, VN30F1M, VN100, HNX30) */}
+            <div className="px-3 py-2 bg-[#0e131f] border-b border-[#1f2738] flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+              <span className="text-[10px] font-semibold text-amber-400 shrink-0">
+                Chỉ số TT:
+              </span>
+              {MARKET_INDEX_STOCKS.map((idxStock) => (
+                <button
+                  key={idxStock.symbol}
+                  type="button"
+                  onClick={() => handleSelectSymbolFromSearch(idxStock)}
+                  className={`px-2 py-0.5 rounded text-[10px] font-bold transition-colors shrink-0 border ${
+                    selectedStock.symbol === idxStock.symbol
+                      ? 'bg-amber-500 text-slate-950 border-amber-400'
+                      : 'bg-amber-950/30 text-amber-300 border-amber-700/40 hover:bg-amber-500/30'
+                  }`}
+                >
+                  {idxStock.symbol}
+                </button>
+              ))}
+            </div>
+
             {/* Quick Popular Ticker Chips */}
             <div className="px-3 py-2 bg-[#111622] border-b border-[#1f2738] flex items-center gap-1.5 overflow-x-auto no-scrollbar">
-              <span className="text-[10px] text-slate-400 shrink-0">Xem nhanh:</span>
+              <span className="text-[10px] text-slate-400 shrink-0">Cổ phiếu:</span>
               {['CDC', 'FPT', 'SSI', 'HPG', 'VCB', 'MWG', 'DIG', 'VND', 'TCB', 'STB'].map((sym) => {
                 const st = allStocks.find((s) => s.symbol === sym);
                 if (!st) return null;
@@ -1028,6 +1083,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
             <div className="flex-1 overflow-y-auto divide-y divide-[#1e2638]">
               {searchResults.map((st) => {
                 const pos = st.change >= 0;
+                const isMarketIdx = MARKET_INDEX_STOCKS.some((m) => m.symbol === st.symbol);
                 return (
                   <button
                     key={st.symbol}
@@ -1040,8 +1096,14 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                         <span className="text-xs font-bold text-white tabular-nums">
                           {st.symbol}
                         </span>
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-[#253047] text-purple-300 font-semibold">
-                          {st.exchange}
+                        <span
+                          className={`text-[9px] px-1.5 py-0.2 rounded font-semibold ${
+                            isMarketIdx
+                              ? 'bg-amber-950/80 text-amber-300 border border-amber-700/50'
+                              : 'bg-[#253047] text-purple-300'
+                          }`}
+                        >
+                          {isMarketIdx ? 'CHỈ SỐ' : st.exchange}
                         </span>
                         {st.is_matched && (
                           <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700/40">
@@ -1068,6 +1130,30 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                   </button>
                 );
               })}
+
+              {/* Fallback direct lookup button if user typed a custom symbol */}
+              {searchQuery.trim().length >= 2 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const custom = resolveStockOrMarketIndex(searchQuery, allStocks);
+                    if (custom) handleSelectSymbolFromSearch(custom);
+                  }}
+                  className="w-full px-3.5 py-3 flex items-center justify-between bg-purple-950/25 hover:bg-purple-900/40 text-left transition-colors"
+                >
+                  <div>
+                    <span className="text-xs font-bold text-purple-300">
+                      Mở trực tiếp biểu đồ mã &ldquo;{searchQuery.trim().toUpperCase()}&rdquo;
+                    </span>
+                    <p className="text-[10px] text-slate-400">
+                      Tự động tải dữ liệu lịch sử giá từ VNDirect API
+                    </p>
+                  </div>
+                  <span className="text-[11px] font-bold text-purple-300 px-2 py-1 rounded bg-purple-600/30">
+                    Xem ngay →
+                  </span>
+                </button>
+              )}
             </div>
           </div>
         </div>

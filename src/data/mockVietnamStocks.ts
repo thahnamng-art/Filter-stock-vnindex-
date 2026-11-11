@@ -1,4 +1,4 @@
-import { StockData, ExchangeType } from '../types/screener';
+import { StockData, ExchangeType, getVietnamTodayDateStr } from '../types/screener';
 import REAL_STOCKS_DATA from './realMarketData.json';
 
 interface RawStockItem {
@@ -142,7 +142,7 @@ export async function syncRealMarketDataFromVNDirect(
 
   const to = Math.floor(Date.now() / 1000);
   const from = to - 380 * 86400;
-  let lastTradingDate = '2026-11-10';
+  let lastTradingDate = getVietnamTodayDateStr();
   const totalUniverse = currentStocks.length;
   const updatedStocks: StockData[] = [...currentStocks];
 

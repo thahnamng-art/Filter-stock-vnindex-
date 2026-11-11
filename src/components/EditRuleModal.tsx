@@ -8,7 +8,11 @@ import {
   McdxOperator,
   VolumeOperator,
   TimeFrame,
-  ExchangeType
+  ExchangeType,
+  getVietnamTodayDateStr,
+  formatVnDateDisplay,
+  getVietnamDateByTradingOffset,
+  getTradingOffsetFromVietnamDate
 } from '../types/screener';
 import { RangeSlider, SingleSlider } from './RangeSlider';
 
@@ -25,7 +29,13 @@ export const EditRuleModal: React.FC<EditRuleModalProps> = ({
   onClose,
   onSave
 }) => {
-  const [draft, setDraft] = useState<AnyFilterRule>({ ...rule });
+  const todayVnDate = getVietnamTodayDateStr();
+  const [draft, setDraft] = useState<AnyFilterRule>(() => {
+    if (rule.rule_type === 'DATE_FILTER' && rule.offset_days === 0) {
+      return { ...rule, target_date: todayVnDate };
+    }
+    return { ...rule };
+  });
 
   if (!isOpen) return null;
 
@@ -69,39 +79,54 @@ export const EditRuleModal: React.FC<EditRuleModalProps> = ({
             <div className="space-y-4">
               {/* Target Trading Date & Session Offset */}
               <div className="p-3.5 rounded-2xl bg-[#151c29] border border-[#232f44] space-y-3">
-                <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
                   <div>
                     <label className="font-semibold text-slate-200 block">
-                      Chọn ngày giao dịch cần lọc
+                      Chọn ngày giao dịch cần lọc (Giờ VN)
                     </label>
                     <span className="text-[11px] text-slate-400">
-                      Toàn bộ chỉ báo RS, RSI, MA, MCDX sẽ được tính tại ngày này
+                      Hôm nay theo giờ Việt Nam:{' '}
+                      <strong className="text-cyan-400">{formatVnDateDisplay(todayVnDate)}</strong>
                     </span>
                   </div>
-                  <input
-                    type="date"
-                    value={draft.target_date}
-                    max="2026-11-10"
-                    onChange={(e) => {
-                      const val = e.target.value || '2026-11-10';
-                      const latest = new Date('2026-11-10').getTime();
-                      const picked = new Date(val).getTime();
-                      const diffCalendarDays = Math.max(
-                        0,
-                        Math.round((latest - picked) / (1000 * 86400))
-                      );
-                      const approxTradingOffset = Math.min(
-                        55,
-                        Math.round((diffCalendarDays * 5) / 7)
-                      );
-                      setDraft({
-                        ...draft,
-                        target_date: val,
-                        offset_days: approxTradingOffset
-                      });
-                    }}
-                    className="bg-[#182030] border border-purple-500/50 rounded-xl px-3 py-2 text-xs text-slate-100 tabular-nums focus:outline-none focus:border-purple-400"
-                  />
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDraft({
+                          ...draft,
+                          target_date: todayVnDate,
+                          offset_days: 0
+                        })
+                      }
+                      className={`px-2.5 py-2 rounded-xl text-[11px] font-bold border transition-colors ${
+                        draft.target_date === todayVnDate || draft.offset_days === 0
+                          ? 'bg-cyan-600/25 border-cyan-500 text-cyan-300'
+                          : 'bg-[#182030] border-[#28354d] text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      Hôm nay ({todayVnDate.slice(8, 10)}/{todayVnDate.slice(5, 7)})
+                    </button>
+                    <input
+                      type="date"
+                      value={draft.target_date}
+                      max={todayVnDate}
+                      onChange={(e) => {
+                        const val = e.target.value || todayVnDate;
+                        const clampedVal = val > todayVnDate ? todayVnDate : val;
+                        const tradingOffset = getTradingOffsetFromVietnamDate(
+                          clampedVal,
+                          todayVnDate
+                        );
+                        setDraft({
+                          ...draft,
+                          target_date: clampedVal,
+                          offset_days: tradingOffset
+                        });
+                      }}
+                      className="bg-[#182030] border border-purple-500/50 rounded-xl px-3 py-2 text-xs text-slate-100 tabular-nums focus:outline-none focus:border-purple-400"
+                    />
+                  </div>
                 </div>
 
                 <SingleSlider
@@ -110,12 +135,15 @@ export const EditRuleModal: React.FC<EditRuleModalProps> = ({
                   step={1}
                   value={draft.offset_days}
                   label="Lùi phiên giao dịch trong quá khứ (Backtest T-N)"
-                  formatValue={(v) => (v === 0 ? 'Hôm nay (T-0)' : `Lùi ${v} phiên (T-${v})`)}
+                  formatValue={(v) =>
+                    v === 0
+                      ? `Hôm nay (${formatVnDateDisplay(todayVnDate)})`
+                      : `Lùi ${v} phiên (${formatVnDateDisplay(
+                          getVietnamDateByTradingOffset(v, todayVnDate)
+                        )})`
+                  }
                   onChange={(offset) => {
-                    const baseDate = new Date('2026-11-10');
-                    const calDays = Math.round((offset * 7) / 5);
-                    baseDate.setDate(baseDate.getDate() - calDays);
-                    const dateStr = baseDate.toISOString().slice(0, 10);
+                    const dateStr = getVietnamDateByTradingOffset(offset, todayVnDate);
                     setDraft({
                       ...draft,
                       offset_days: offset,
@@ -123,7 +151,7 @@ export const EditRuleModal: React.FC<EditRuleModalProps> = ({
                     });
                   }}
                   presets={[
-                    { label: 'Hôm nay', value: 0 },
+                    { label: `Hôm nay (${todayVnDate.slice(8, 10)}/${todayVnDate.slice(5, 7)})`, value: 0 },
                     { label: 'T-1 (Hôm qua)', value: 1 },
                     { label: 'T-3', value: 3 },
                     { label: 'T-5 (1 Tuần)', value: 5 },

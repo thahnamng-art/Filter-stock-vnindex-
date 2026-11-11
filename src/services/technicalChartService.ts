@@ -1,4 +1,4 @@
-import { StockData, TimeFrame } from '../types/screener';
+import { StockData, TimeFrame, getVietnamTodayDateStr } from '../types/screener';
 
 export interface OhlcvCandle {
   timestamp: number;
@@ -60,10 +60,11 @@ export interface FullTechnicalChartData {
 // Cache for live VNDirect OHLCV responses
 const liveOhlcvCache = new Map<string, OhlcvCandle[]>();
 
-// Generate trading dates ending at 2026-11-10
+// Generate trading dates ending at current Vietnam date (e.g. 2026-11-11)
 function buildTradingDates(count: number): { timestamp: number; dateStr: string; shortDate: string; monthLabel?: string }[] {
   const result: { timestamp: number; dateStr: string; shortDate: string; monthLabel?: string }[] = [];
-  const d = new Date('2026-11-10T09:00:00Z');
+  const todayVn = getVietnamTodayDateStr();
+  const d = new Date(`${todayVn}T09:00:00Z`);
 
   while (result.length < count) {
     const day = d.getUTCDay();
@@ -102,6 +103,205 @@ function seededNoise(symbol: string, idx: number): number {
   h ^= idx * 374761393;
   h = Math.imul(h, 16777619);
   return ((h >>> 0) % 1000) / 1000;
+}
+
+// Build 260-bar historical series for major Vietnam Market Indices (VNINDEX, VN30, HNXINDEX, UPCOMINDEX, VN30F1M, VN100, HNX30)
+function buildIndexSeries(
+  seedKey: string,
+  endClose: number,
+  stepAmplitude: number,
+  baseVolume: number
+): { closes: number[]; volumes: number[]; change: number; changePct: number } {
+  const len = 260;
+  const closes = new Array<number>(len);
+  const volumes = new Array<number>(20);
+  let curr = endClose;
+  closes[len - 1] = curr;
+
+  for (let i = len - 2; i >= 0; i--) {
+    const n = seededNoise(seedKey, i);
+    const delta = (n - 0.482) * stepAmplitude;
+    curr = Math.max(endClose * 0.65, Math.round((curr - delta) * 100) / 100);
+    closes[i] = curr;
+  }
+
+  for (let i = 0; i < 20; i++) {
+    const nv = seededNoise(`${seedKey}_V`, i);
+    volumes[i] = Math.round(baseVolume * (0.72 + nv * 0.65));
+  }
+
+  const prev = closes[len - 2] || endClose;
+  const change = Math.round((endClose - prev) * 100) / 100;
+  const changePct = prev > 0 ? Math.round((change / prev) * 10000) / 100 : 0;
+
+  return { closes, volumes, change, changePct };
+}
+
+export const MARKET_INDEX_STOCKS: StockData[] = (() => {
+  const configs: Array<{
+    symbol: string;
+    exchange: 'HOSE' | 'HNX' | 'UPCOM';
+    name: string;
+    industry: string;
+    price: number;
+    step: number;
+    vol: number;
+    val: number;
+  }> = [
+    {
+      symbol: 'VNINDEX',
+      exchange: 'HOSE',
+      name: 'Chỉ số VN-Index (Toàn thị trường HOSE)',
+      industry: 'Chỉ số Thị trường',
+      price: 1740.1,
+      step: 14.5,
+      vol: 785000000,
+      val: 19450.0
+    },
+    {
+      symbol: 'VN30',
+      exchange: 'HOSE',
+      name: 'Chỉ số VN30-Index (30 CP vốn hóa lớn nhất HOSE)',
+      industry: 'Chỉ số Thị trường',
+      price: 1815.45,
+      step: 15.8,
+      vol: 295000000,
+      val: 9820.0
+    },
+    {
+      symbol: 'HNXINDEX',
+      exchange: 'HNX',
+      name: 'Chỉ số HNX-Index (Sàn Giao dịch Chứng khoán Hà Nội)',
+      industry: 'Chỉ số Thị trường',
+      price: 235.82,
+      step: 2.35,
+      vol: 68500000,
+      val: 1380.0
+    },
+    {
+      symbol: 'UPCOMINDEX',
+      exchange: 'UPCOM',
+      name: 'Chỉ số UPCoM-Index (Thị trường Đại chúng chưa niêm yết)',
+      industry: 'Chỉ số Thị trường',
+      price: 94.28,
+      step: 0.92,
+      vol: 42000000,
+      val: 690.0
+    },
+    {
+      symbol: 'VN30F1M',
+      exchange: 'HOSE',
+      name: 'Hợp đồng tương lai Chỉ số VN30F1M (Phái sinh)',
+      industry: 'Chỉ số Phái sinh',
+      price: 1818.2,
+      step: 16.4,
+      vol: 195000,
+      val: 35400.0
+    },
+    {
+      symbol: 'VN100',
+      exchange: 'HOSE',
+      name: 'Chỉ số VN100-Index (100 CP dẫn đầu HOSE)',
+      industry: 'Chỉ số Thị trường',
+      price: 1692.6,
+      step: 14.1,
+      vol: 560000000,
+      val: 15800.0
+    },
+    {
+      symbol: 'HNX30',
+      exchange: 'HNX',
+      name: 'Chỉ số HNX30-Index (30 CP dẫn đầu sàn HNX)',
+      industry: 'Chỉ số Thị trường',
+      price: 512.35,
+      step: 5.4,
+      vol: 44000000,
+      val: 980.0
+    }
+  ];
+
+  return configs.map((cfg) => {
+    const s = buildIndexSeries(cfg.symbol, cfg.price, cfg.step, cfg.vol);
+    return {
+      symbol: cfg.symbol,
+      exchange: cfg.exchange,
+      name: cfg.name,
+      industry: cfg.industry,
+      price: cfg.price,
+      change: s.change,
+      change_pct: s.changePct,
+      total_volume: cfg.vol,
+      total_value: cfg.val,
+      has_latest_bctc: true,
+      eps: 0,
+      pe: 14.2,
+      pb: 1.75,
+      historical_closes: s.closes,
+      historical_volumes: s.volumes,
+      rs_52w: 80,
+      rs_1m: 78,
+      rsi_14: 58.5,
+      mcdx_banker: 62.4,
+      mcdx_hot_money: 24.1,
+      mcdx_retailer: 13.5
+    };
+  });
+})();
+
+/**
+ * Finds a stock or market index by symbol (handling aliases like HNX -> HNXINDEX, UPCOM -> UPCOMINDEX, VN-INDEX -> VNINDEX),
+ * or synthesizes a dynamic StockData object so any ticker can be charted.
+ */
+export function resolveStockOrMarketIndex(
+  rawQuery: string,
+  allStocks: StockData[]
+): StockData | null {
+  const clean = rawQuery.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!clean) return null;
+
+  const aliasMap: Record<string, string> = {
+    VNINDEX: 'VNINDEX',
+    VNIDX: 'VNINDEX',
+    VNI: 'VNINDEX',
+    HOSE: 'VNINDEX',
+    VN30: 'VN30',
+    VN30INDEX: 'VN30',
+    HNX: 'HNXINDEX',
+    HNXINDEX: 'HNXINDEX',
+    UPCOM: 'UPCOMINDEX',
+    UPCOMINDEX: 'UPCOMINDEX',
+    VN30F1M: 'VN30F1M',
+    VN100: 'VN100',
+    HNX30: 'HNX30'
+  };
+
+  const targetSym = aliasMap[clean] || clean;
+
+  const foundIndex = MARKET_INDEX_STOCKS.find((idx) => idx.symbol === targetSym);
+  if (foundIndex) return foundIndex;
+
+  const foundStock = allStocks.find((st) => st.symbol.toUpperCase() === targetSym);
+  if (foundStock) return foundStock;
+
+  // Synthesize dynamic ticker so user can type any new/custom code and load live from VNDirect
+  const dyn = buildIndexSeries(targetSym, 25.0, 0.45, 500000);
+  return {
+    symbol: targetSym,
+    exchange: 'HOSE',
+    name: `${targetSym} - Dữ liệu Biểu đồ Trực tuyến`,
+    industry: 'Cổ phiếu / Chỉ số',
+    price: 25.0,
+    change: dyn.change,
+    change_pct: dyn.changePct,
+    total_volume: 500000,
+    total_value: 12.5,
+    has_latest_bctc: true,
+    eps: 2200,
+    pe: 12.5,
+    pb: 1.5,
+    historical_closes: dyn.closes,
+    historical_volumes: dyn.volumes
+  };
 }
 
 // Reconstruct realistic OHLCV candles from a stock's historical_closes & historical_volumes
@@ -174,10 +374,22 @@ export async function fetchLiveOhlcvFromVNDirect(
     return liveOhlcvCache.get(upper)!;
   }
 
+  // Map index display symbols to VNDirect dchart symbol codes
+  const vndirectSymbolMap: Record<string, string> = {
+    VNINDEX: 'VNINDEX',
+    VN30: 'VN30',
+    HNXINDEX: 'HNX',
+    UPCOMINDEX: 'UPCOM',
+    VN100: 'VN100',
+    HNX30: 'HNX30',
+    VN30F1M: 'VN30F1M'
+  };
+  const apiSymbol = vndirectSymbolMap[upper] || upper;
+
   const nowSec = Math.floor(Date.now() / 1000);
   const fromSec = nowSec - 86400 * 400; // ~260 trading sessions
   const directUrl = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
-    upper
+    apiSymbol
   )}&from=${fromSec}&to=${nowSec}`;
 
   const candidateUrls = [

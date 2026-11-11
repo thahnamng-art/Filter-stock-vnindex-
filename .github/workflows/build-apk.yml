@@ -5,60 +5,78 @@ on:
     branches:
       - main
       - master
-      - '**'
     tags:
       - 'v*'
   release:
     types: [created, published]
   workflow_dispatch:
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build-android-apk:
     name: Build Android APK
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-      - name: 1. Checkout repository
-        uses: actions/checkout@v4
+      - name: 1. Checkout repository (Native Git - No Node 20 warning)
+        run: |
+          git init .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout -f FETCH_HEAD
 
-      - name: 2. Set up Node.js 22 LTS
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - name: 2. Configure Pre-installed Java JDK 21 & Node.js
+        run: |
+          if [ -d "/usr/lib/jvm/temurin-21-jdk-amd64" ]; then
+            echo "JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64" >> "$GITHUB_ENV"
+            echo "/usr/lib/jvm/temurin-21-jdk-amd64/bin" >> "$GITHUB_PATH"
+          fi
+          java -version
+          node -v
+          npm -v
 
-      - name: 3. Set up Java JDK 21 (Required by Capacitor 8 & Gradle 8.14)
-        uses: actions/setup-java@v5
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: 4. Accept Android SDK Licenses & Install SDK 36
+      - name: 3. Accept Android SDK Licenses & Install SDK 36
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0" 2>/dev/null || true
 
-      - name: 5. Install NPM Dependencies & Capacitor Android
+      - name: 4. Install NPM Dependencies & Capacitor Android
         run: |
           npm install --legacy-peer-deps
           npm install --no-save --legacy-peer-deps @capacitor/core@8 @capacitor/cli@8 @capacitor/android@8
 
-      - name: 6. Build Web Assets (Vite)
+      - name: 5. Build Web Assets (Vite)
         run: |
           npm run build
 
-      - name: 7. Initialize Clean Native Android Project & Sync Capacitor
+      - name: 6. Initialize Native Android Project, Inject Fixed Keystore & Auto-Increment VersionCode
         run: |
           rm -rf android
           npx cap add android
           npx cap sync android
           chmod +x android/gradlew
 
-      - name: 8. Build Debug APK (Cài đặt trực tiếp trên mọi máy Android)
+          # 1. Cài đặt Keystore cố định (android-keystore/fialda-debug.keystore) để mọi bản APK có CÙNG CHỮ KÝ SỐ
+          #    Giúp điện thoại Android cho phép CẬP NHẬT TRỰC TIẾP (Update) đè lên bản cũ mà không cần gỡ cài đặt!
+          mkdir -p ~/.android
+          if [ -f "android-keystore/fialda-debug.keystore" ]; then
+            cp -f android-keystore/fialda-debug.keystore ~/.android/debug.keystore
+            cp -f android-keystore/fialda-debug.keystore android/app/debug.keystore
+            echo "✅ Đã áp dụng Keystore cố định từ android-keystore/fialda-debug.keystore"
+          fi
+
+          # 2. Tự động tăng versionCode & versionName theo GITHUB_RUN_NUMBER để Android nhận diện bản mới hơn
+          RUN_NUM=${GITHUB_RUN_NUMBER:-1}
+          VER_CODE=$((100 + RUN_NUM))
+          VER_NAME="1.0.${RUN_NUM}"
+          sed -i "s/versionCode 1/versionCode ${VER_CODE}/g" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"${VER_NAME}\"/g" android/app/build.gradle
+          echo "✅ Đã cập nhật versionCode=${VER_CODE}, versionName=${VER_NAME}"
+
+      - name: 7. Build Signed Updatable APK
         run: |
           cd android
           ./gradlew assembleDebug --no-daemon --stacktrace
@@ -67,32 +85,26 @@ jobs:
           find android/app/build/outputs/apk/debug -name "*.apk" -exec cp {} release-apks/fialda-quant-screener-debug.apk \;
           ls -lh release-apks/
 
-      - name: 9. Upload APK to GitHub Actions Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: fialda-quant-apk
-          path: release-apks/*.apk
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: 10. Auto-Publish APK to GitHub Releases
-        continue-on-error: true
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v1.0.{0}', github.run_number) }}
-          name: "Fialda Quant Screener APK - Build #${{ github.run_number }}"
-          files: release-apks/*.apk
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 11. Build Summary
+      - name: 8. Publish APK to GitHub Releases via GitHub CLI
         run: |
-          echo "### ✅ Bản dựng Android APK hoàn tất thành công!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**File APK đã tạo:**" >> $GITHUB_STEP_SUMMARY
-          ls -lh release-apks/ >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "👉 Tải file **fialda-quant-screener-debug.apk** tại mục **Artifacts** bên dưới hoặc trong mục **Releases** của kho lưu trữ GitHub!" >> $GITHUB_STEP_SUMMARY
+          TAG_NAME="v1.0.${GITHUB_RUN_NUMBER}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          gh release create "$TAG_NAME" release-apks/*.apk \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Fialda Quant Screener APK v1.0.${GITHUB_RUN_NUMBER} (Hỗ trợ Update trực tiếp)" \
+            --notes "Bản cài đặt Android APK tự động (versionCode $((100 + ${GITHUB_RUN_NUMBER:-1})), ký bằng Keystore cố định hỗ trợ cài đè cập nhật trực tiếp không cần gỡ bản cũ)." \
+            --latest || \
+          gh release upload "$TAG_NAME" release-apks/*.apk \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber || true
+
+      - name: 9. Build Summary
+        run: |
+          echo "### ✅ Bản dựng Android APK (Hỗ trợ Update trực tiếp) hoàn tất!" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Phiên bản:** \`v1.0.${GITHUB_RUN_NUMBER}\` (\`versionCode: $((100 + ${GITHUB_RUN_NUMBER:-1}))\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Chữ ký số (Keystore):** Cố định (\`android-keystore/fialda-debug.keystore\`) — cài đè cập nhật trực tiếp lên bản trước mà không mất dữ liệu." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh release-apks/ >> "$GITHUB_STEP_SUMMARY"

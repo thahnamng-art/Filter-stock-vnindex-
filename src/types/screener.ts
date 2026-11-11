@@ -154,3 +154,91 @@ export interface ScreenerPreset {
   isCustom?: boolean;
   rules: AnyFilterRule[];
 }
+
+// ============================================================================
+// Vietnam Timezone (UTC+7 / Asia/Ho_Chi_Minh) Date Utilities
+// ============================================================================
+
+/**
+ * Returns today's date string in YYYY-MM-DD format according to Vietnam Timezone (UTC+7)
+ */
+export function getVietnamTodayDateStr(): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(new Date());
+    const y = parts.find((p) => p.type === 'year')?.value;
+    const m = parts.find((p) => p.type === 'month')?.value;
+    const d = parts.find((p) => p.type === 'day')?.value;
+    if (y && m && d) {
+      return `${y}-${m}-${d}`;
+    }
+  } catch {
+    // Fallback to manual UTC+7 calculation
+  }
+  const vnNow = new Date(Date.now() + 7 * 3600 * 1000);
+  return vnNow.toISOString().slice(0, 10);
+}
+
+/**
+ * Converts YYYY-MM-DD into Vietnamese display format DD/MM/YYYY (e.g. '2026-11-11' -> '11/11/2026')
+ */
+export function formatVnDateDisplay(dateStr: string): string {
+  if (!dateStr || !dateStr.includes('-')) return dateStr;
+  const [y, m, d] = dateStr.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+/**
+ * Calculates the target YYYY-MM-DD date when stepping back `offsetTradingDays` trading sessions from Vietnam today
+ */
+export function getVietnamDateByTradingOffset(
+  offsetTradingDays: number,
+  anchorDateStr: string = getVietnamTodayDateStr()
+): string {
+  if (offsetTradingDays <= 0) return anchorDateStr;
+  const [y, m, d] = anchorDateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d, 9, 0, 0));
+  let remaining = offsetTradingDays;
+
+  while (remaining > 0) {
+    dt.setUTCDate(dt.getUTCDate() - 1);
+    const dayOfWeek = dt.getUTCDay();
+    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+      remaining--;
+    }
+  }
+
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yy}-${mm}-${dd}`;
+}
+
+/**
+ * Calculates how many trading sessions (`offset_days`) a picked YYYY-MM-DD date is before Vietnam today
+ */
+export function getTradingOffsetFromVietnamDate(
+  pickedDateStr: string,
+  anchorDateStr: string = getVietnamTodayDateStr()
+): number {
+  if (!pickedDateStr || pickedDateStr >= anchorDateStr) return 0;
+  const [ay, am, ad] = anchorDateStr.split('-').map(Number);
+  const [py, pm, pd] = pickedDateStr.split('-').map(Number);
+  const cur = new Date(Date.UTC(ay, am - 1, ad, 9, 0, 0));
+  const target = new Date(Date.UTC(py, pm - 1, pd, 9, 0, 0));
+
+  let offset = 0;
+  while (cur.getTime() > target.getTime() && offset < 250) {
+    cur.setUTCDate(cur.getUTCDate() - 1);
+    const day = cur.getUTCDay();
+    if (day !== 0 && day !== 6) {
+      offset++;
+    }
+  }
+  return Math.min(60, offset);
+}
+
