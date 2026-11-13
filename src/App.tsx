@@ -60,8 +60,18 @@ const INITIAL_RULES: AnyFilterRule[] = [
     rule_type: 'VALUE',
     name: 'Giá trị giao dịch',
     enabled: true,
-    min_value: 5.0,
+    min_value: 100.0,
     max_value: 2000.0
+  },
+  {
+    id: 'r_ma50',
+    rule_type: 'PRICE_VS_MA',
+    name: 'Giá vượt SMA 50',
+    enabled: true,
+    ma_type: 'SMA',
+    period: 50,
+    operator: '>',
+    timeframe: '1D'
   },
   {
     id: 'r_rs52w',
@@ -132,7 +142,7 @@ export default function App() {
     {
       id: 'preset_banker_breakout',
       name: 'Dòng tiền Banker cắt lên 25%',
-      description: 'MCDX Banker từ mức thấp cắt lên qua 25%, khối lượng tăng vọt và RS52w >= 70',
+      description: 'GTGD >= 100 Tỷ, Giá > SMA50, Giá > SMA200, MCDX Banker cắt lên qua 25%, khối lượng tăng vọt và RS52w >= 70',
       isCustom: false,
       rules: INITIAL_RULES
     },
@@ -257,19 +267,9 @@ export default function App() {
   const [isPythonModalOpen, setIsPythonModalOpen] = useState(false);
   const [isGithubModalOpen, setIsGithubModalOpen] = useState(false);
 
-  // Load custom presets from localStorage on mount
+  // Automatically trigger full data sync on mount to fetch freshest market data
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(PRESETS_STORAGE_KEY);
-      if (saved) {
-        const parsed: ScreenerPreset[] = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setPresets((prev) => [...prev, ...parsed]);
-        }
-      }
-    } catch {
-      // ignore
-    }
+    handleStartBatchSync();
   }, []);
 
   // Save custom presets

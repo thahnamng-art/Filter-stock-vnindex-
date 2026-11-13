@@ -59,3 +59,30 @@
 - **Vấn đề 2 (Gõ VNINDEX, VN30 vào biểu đồ không có):** Bổ sung danh sách `MARKET_INDEX_STOCKS` (`VNINDEX`, `VN30`, `HNXINDEX`, `UPCOMINDEX`, `VN30F1M`, `VN100`, `HNX30`) và hàm `resolveStockOrMarketIndex` vào `technicalChartService.ts`, `FialdaTechnicalChart.tsx` và `App.tsx`, kèm thanh nút bấm nhanh "Chỉ số TT" trong ô tìm kiếm biểu đồ.
 - **Vấn đề 3 (APK mới không cho Update đè lên APK cũ):** Tạo file chữ ký số cố định `android-keystore/fialda-debug.keystore` lưu trong dự án và cấu hình `.github/workflows/build-apk.yml` tự nạp keystore này + tự tăng `versionCode = 100 + GITHUB_RUN_NUMBER` mỗi lần build.
 - **Quy tắc mới:** Khởi tạo `MEMORY_BANK.md` để lưu vết và tra cứu xuyên suốt sau mỗi tác vụ.
+
+### [2026-11-12] Nâng cấp Tính năng Chuẩn Fialda v2: Ranh giới Tầng Co giãn, Trục Giá Đồng bộ Lưới & Bảng Phân tích Fialda
+- **1. Ranh giới co giãn giữa các tầng chỉ báo (Interactive Drag-to-Resize Splitters):**
+  - Tích hợp dải phân cách kéo-thả giữa mọi cặp tầng chỉ báo liền kề (`macd` ↔ `price` ↔ `volume` ↔ `rsi` ↔ `stoch` ↔ `mcdx` ↔ `vnindex`).
+  - Hỗ trợ thao tác mượt mà bằng chuột (Desktop) và chạm vuốt (Mobile/Tablet) với con trỏ `row-resize`, hiển thị vạch gờ tay nắm trực quan và đổi màu sáng khi rê chuột hoặc kéo.
+  - Phân bổ linh hoạt chiều cao pixel (`newUpper`, `newLower`) cho 2 tầng liền kề với ngưỡng an toàn tối thiểu 36px, giúp người dùng tùy ý mở rộng tầng nến giá hoặc phóng to riêng từng chỉ báo để soi chi tiết.
+- **2. Trục giá bên phải đồng bộ tuyệt đối với các đường lưới ngang (Dynamic Price Grid Labels):**
+  - Trục giá bên phải hiển thị đầy đủ các con số giá trị tương ứng chính xác 1:1 với từng đường lưới ngang `priceGridTicks` của biểu đồ nến giá.
+  - Tọa độ số liệu tính toán chính xác theo công thức `top: ${(toPriceY(tick) / priceH) * 100}%`. Khi người dùng zoom in/out, pan hoặc co giãn trục giá, các vạch số và đường lưới co giãn, dịch chuyển đồng bộ tức thì.
+  - Hỗ trợ chế độ giá tuyệt đối (nghìn đồng) và chế độ `%` biến động giá (`+X.XX%` / `-X.XX%`).
+  - Đi kèm nhãn giá đóng cửa nến hiện tại (tím nổi bật) và nhãn giá bám sát con trỏ crosshair khi rê chuột.
+- **3. Tái hiện trọn bộ tính năng phân tích kỹ thuật chuẩn Fialda Chart (v2.fialda.vn):**
+  - **Kiểu biểu đồ đa dạng (Chart Styles):** Chuyển đổi linh hoạt giữa Nến Nhật (Candlesticks), Nến Heikin Ashi, Đường nét (Line), Vùng diện tích (Area).
+  - **Khung thời gian (Timeframes):** 1D (Ngày), 1W (Tuần), 1M (Tháng), 1H (Giờ), 15m (Phút).
+  - **Thanh chọn khoảng thời gian nhanh (Quick Range Bar):** Dưới đáy biểu đồ với các mốc 1D, 5D, 1M, 3M, 6M, 1Y, Tất cả.
+  - **Nút chụp ảnh màn hình biểu đồ (Snapshot Camera):** Tiện lợi lưu lại ảnh phân tích kỹ thuật.
+  - **Sidebar phân tích Fialda bên phải (Fialda Right Panel):**
+    - **Tab Sổ lệnh (Tape):** 3 mức giá Mua/Bán tốt nhất kèm khối lượng + bảng khớp lệnh gần nhất (Real-time tape) phân màu Mua/Bán chủ động.
+    - **Tab Khối ngoại & Tự doanh:** Giá trị Mua, Bán, Mua ròng của Khối ngoại hôm nay (Tỷ VNĐ), vị thế ước tính Tự doanh CTCK và biểu đồ mini bar khối ngoại 5 phiên gần nhất.
+    - **Tab Tài chính & Doanh nghiệp:** Thông tin mã CP, sàn, ngành nghề, vốn hóa thị trường, khối lượng lưu hành ước tính, P/E, P/B, EPS, ROE, ROA.
+  - **Bảo toàn 100% các chỉ báo kỹ thuật mặc định:** Giữ nguyên vẹn 7 tầng chỉ báo cốt lõi: MACD (12, 26, 9), Nến Giá + MA 30/50/200 + Bollinger Bands (20, 2), Volume + SMA 10, RSI 14, Stochastic (13, 5, 5), Dòng tiền cá mập MCDX Banker, và Nến chỉ số VNINDEX đồng bộ.
+
+### [2026-11-12] Khắc phục Lỗi Dev Server Không Khởi Động (Dev Server Startup Fix)
+- **Nguyên nhân:** Môi trường container khởi động lại làm mất thư mục `node_modules` (`node_modules/.bin/vite` không tồn tại) và cấu hình `server` trong `vite.config.ts` chưa khóa cứng `port: 3000` và `host: '0.0.0.0'`.
+- **Giải pháp:** Cài đặt lại đầy đủ dependencies qua `npm install`, bổ sung cấu hình `port: 3000, host: '0.0.0.0'` trực tiếp vào `vite.config.ts`, kiểm tra build/lint và khởi động lại Vite Dev Server thành công.
+
+

@@ -1,6 +1,0 @@
-{
-  "summary":  "Kế hoạch xây dựng Tab Biểu đồ kỹ thuật đa tầng chuẩn Fialda Mobile (7 tầng chỉ báo: MACD, Nến Nhật + MA 30/50/200 + Bollinger Bands, Khối lượng + SMA10, RSI 14, Stochastic 13-5-5, MCDX 50-50-1.5-30-40, và VNINDEX), hỗ trợ tự nhập mã bất kỳ trong 1.626 cổ phiếu để tải lịch sử giá thực tế từ VNDirect và chuyển thẳng sang biểu đồ khi chạm vào cổ phiếu từ kết quả lọc.",
-  "updatedAt":  "2026-11-11T04:50:04.643333869Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}
