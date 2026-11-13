@@ -14,7 +14,14 @@ import {
   Github,
   CandlestickChart
 } from 'lucide-react';
-import { AnyFilterRule, StockData, ScreenerPreset, ExchangeType, getVietnamTodayDateStr } from './types/screener';
+import {
+  AnyFilterRule,
+  StockData,
+  ScreenerPreset,
+  ExchangeType,
+  getVietnamTodayDateStr,
+  formatVnDateDisplay
+} from './types/screener';
 import {
   initializeVietnamStockUniverse,
   syncRealMarketDataFromVNDirect,
@@ -23,6 +30,12 @@ import {
   SyncBatchProgress
 } from './data/mockVietnamStocks';
 import { evaluateScreener } from './services/screenerEngine';
+import {
+  loadCachedMarketUniverse,
+  saveCachedMarketUniverse,
+  clearCachedMarketUniverse,
+  getQuickCacheMeta
+} from './services/marketCacheStorage';
 import { resolveStockOrMarketIndex } from './services/technicalChartService';
 import { FilterCard } from './components/FilterCard';
 import { EditRuleModal } from './components/EditRuleModal';
@@ -186,14 +199,11 @@ export default function App() {
   // UI Navigation states
   const [activeTab, setActiveTab] = useState<'BUILDER' | 'RESULTS' | 'CHART'>('BUILDER');
   const [desktopRightTab, setDesktopRightTab] = useState<'RESULTS' | 'CHART'>('RESULTS');
-  const [chartSymbol, setChartSymbol] = useState<string>('CDC');
+  const [chartSymbol, setChartSymbol] = useState<string>('VNINDEX');
   const [viewMode, setViewMode] = useState<'MOBILE' | 'DESKTOP'>('MOBILE');
 
-  // Realtime 5s timer states
-  const [isAutoRefresh] = useState(true);
-  const [countdown, setCountdown] = useState(5);
+  // Session & Sync states (100% real VNDirect data + IndexedDB cache, no 5s random tick simulator)
   const [sessionMinutes] = useState(165); // 165 phút trong phiên
-  const [, setLastUpdated] = useState<Date>(new Date());
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
@@ -202,7 +212,15 @@ export default function App() {
   const [syncMode, setSyncMode] = useState<SyncScopeMode>('FULL_1626');
   const [syncExchanges, setSyncExchanges] = useState<ExchangeType[]>(['HOSE', 'HNX', 'UPCOM']);
   const [batchProgress, setBatchProgress] = useState<SyncBatchProgress | null>(null);
-  const [lastSyncDate, setLastSyncDate] = useState<string>(() => getVietnamTodayDateStr());
+  const [lastSyncDate, setLastSyncDate] = useState<string>(() => {
+    const quickMeta = getQuickCacheMeta();
+    return quickMeta?.lastSyncDate || getVietnamTodayDateStr();
+  });
+  const [cacheUpdatedAt, setCacheUpdatedAt] = useState<string | null>(() => {
+    const quickMeta = getQuickCacheMeta();
+    return quickMeta?.updatedAt || null;
+  });
+  const [isRestoredFromCache, setIsRestoredFromCache] = useState<boolean>(false);
   const abortSyncRef = useRef<boolean>(false);
 
   const handleToggleSyncExchange = (ex: ExchangeType) => {
@@ -214,16 +232,15 @@ export default function App() {
     });
   };
 
-  // Live real data sync from VNDirect across all 1,626 stocks
-  const handleStartBatchSync = async () => {
+  // Progressive real data sync from VNDirect across all 1,626 stocks + automatic IndexedDB persistence
+  const runBatchSyncWithBase = async (baseStocks: StockData[], customMode?: SyncScopeMode) => {
     abortSyncRef.current = false;
     setIsSyncing(true);
-    setSyncStatusMsg(
-      `Đang kết nối VNDirect đồng bộ ${stocks.length.toLocaleString()} mã CP (HOSE, HNX, UPCoM)...`
-    );
+    const activeMode = customMode || syncMode;
+
     try {
-      const res = await syncRealMarketDataFromVNDirect(stocks, {
-        mode: syncMode,
+      const res = await syncRealMarketDataFromVNDirect(baseStocks, {
+        mode: activeMode,
         targetExchanges: syncExchanges,
         batchSize: 45,
         timeoutMs: 3200,
@@ -232,14 +249,38 @@ export default function App() {
           setBatchProgress(prog);
           const pct = Math.round((prog.processed / Math.max(1, prog.totalTarget)) * 100);
           setSyncStatusMsg(
-            `Đang đồng bộ Lô ${prog.batchIndex}/${prog.totalBatches}: ${prog.processed.toLocaleString()}/${prog.totalTarget.toLocaleString()} mã (${pct}%) — HTTP Live: ${prog.liveUpdatedCount}`
+            `Đang đồng bộ cuốn chiếu Lô ${prog.batchIndex}/${prog.totalBatches}: ${prog.processed.toLocaleString()}/${prog.totalTarget.toLocaleString()} mã (${pct}%) — HTTP Live: ${prog.liveUpdatedCount} · Tự động lưu IndexedDB`
           );
+        },
+        onIncrementalStocksUpdate: (stocksSnapshot, meta) => {
+          setStocks(stocksSnapshot);
+          setLastSyncDate(meta.lastDate);
+          saveCachedMarketUniverse({
+            stocks: stocksSnapshot,
+            lastSyncDate: meta.lastDate,
+            liveHttpCount: meta.liveHttpCount
+          }).then((savedMeta) => {
+            if (savedMeta) {
+              setCacheUpdatedAt(savedMeta.updatedAt);
+            }
+          });
         }
       });
+
       setStocks(res.stocks);
       setLastSyncDate(res.lastDate);
+
+      const savedMeta = await saveCachedMarketUniverse({
+        stocks: res.stocks,
+        lastSyncDate: res.lastDate,
+        liveHttpCount: res.liveHttpCount
+      });
+      if (savedMeta) {
+        setCacheUpdatedAt(savedMeta.updatedAt);
+      }
+
       setSyncStatusMsg(
-        `Đã đồng bộ ${res.successCount.toLocaleString()} mã CP (HOSE: ${res.breakdown.HOSE} · HNX: ${res.breakdown.HNX} · UPCoM: ${res.breakdown.UPCOM} · HTTP Live: ${res.liveHttpCount} — Phiên ${res.lastDate})`
+        `Đã đồng bộ & lưu IndexedDB ${res.successCount.toLocaleString()} mã CP (HOSE: ${res.breakdown.HOSE} · HNX: ${res.breakdown.HNX} · UPCoM: ${res.breakdown.UPCOM} · HTTP Live: ${res.liveHttpCount} — Phiên ${formatVnDateDisplay(res.lastDate)})`
       );
       setTimeout(() => setSyncStatusMsg(null), 7000);
     } catch (err: any) {
@@ -248,6 +289,24 @@ export default function App() {
     } finally {
       setIsSyncing(false);
     }
+  };
+
+  const handleStartBatchSync = () => {
+    setSyncStatusMsg(
+      `Đang kết nối VNDirect đồng bộ cuốn chiếu ${stocks.length.toLocaleString()} mã CP (HOSE, HNX, UPCoM)...`
+    );
+    runBatchSyncWithBase(stocks);
+  };
+
+  const handleClearCacheAndResync = async () => {
+    abortSyncRef.current = true;
+    await clearCachedMarketUniverse();
+    const freshEmbedded = initializeVietnamStockUniverse();
+    setStocks(freshEmbedded);
+    setCacheUpdatedAt(null);
+    setIsRestoredFromCache(false);
+    setSyncStatusMsg('Đã xóa Cache IndexedDB — Đang đồng bộ lại toàn bộ 1,626 mã từ VNDirect...');
+    runBatchSyncWithBase(freshEmbedded, 'FULL_1626');
   };
 
   const handleAbortSync = () => {
@@ -267,9 +326,43 @@ export default function App() {
   const [isPythonModalOpen, setIsPythonModalOpen] = useState(false);
   const [isGithubModalOpen, setIsGithubModalOpen] = useState(false);
 
-  // Automatically trigger full data sync on mount to fetch freshest market data
+  // On mount: 1) Immediately restore latest market data from IndexedDB (previous session), 2) Start progressive sync
   useEffect(() => {
-    handleStartBatchSync();
+    let mounted = true;
+    (async () => {
+      const cached = await loadCachedMarketUniverse();
+      if (!mounted) return;
+
+      if (cached && Array.isArray(cached.stocks) && cached.stocks.length > 0) {
+        setStocks(cached.stocks);
+        setLastSyncDate(cached.lastSyncDate);
+        setCacheUpdatedAt(cached.updatedAt);
+        setIsRestoredFromCache(true);
+        setSyncStatusMsg(
+          `Đã nạp ngay dữ liệu từ lần mở trước (${cached.updatedAt}) — Đang đồng bộ cuốn chiếu dữ liệu mới nhất...`
+        );
+        runBatchSyncWithBase(cached.stocks, 'FULL_1626');
+      } else {
+        // First time ever opening the app: save initial snapshot into IndexedDB and start progressive sync
+        const initialMeta = await saveCachedMarketUniverse({
+          stocks,
+          lastSyncDate: getVietnamTodayDateStr(),
+          liveHttpCount: 0
+        });
+        if (mounted && initialMeta) {
+          setCacheUpdatedAt(initialMeta.updatedAt);
+        }
+        setSyncStatusMsg(
+          `Đang kết nối VNDirect đồng bộ cuốn chiếu ${stocks.length.toLocaleString()} mã CP...`
+        );
+        runBatchSyncWithBase(stocks, 'FULL_1626');
+      }
+    })();
+
+    return () => {
+      mounted = false;
+      abortSyncRef.current = true;
+    };
   }, []);
 
   // Save custom presets
@@ -304,56 +397,6 @@ export default function App() {
       // ignore
     }
   };
-
-  // Background 5-second tick simulator on active stocks
-  useEffect(() => {
-    if (!isAutoRefresh) return;
-
-    const timer = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev <= 1) {
-          setStocks((prevStocks) => {
-            return prevStocks.map((stock, idx) => {
-              // Tick top 350 liquid stocks + random 25% of remaining universe every 5s
-              if (idx > 350 && Math.random() > 0.25) return stock;
-
-              const delta = (Math.random() - 0.48) * 0.12;
-              const newPrice = Math.max(0.5, Math.round((stock.price + delta) * 100) / 100);
-              const volAdd = Math.floor(Math.random() * 12000 + 500);
-              const newVol = stock.total_volume + volAdd;
-              const newVal = Math.round((stock.total_value + (volAdd * newPrice * 1000) / 1e9) * 10) / 10;
-
-              const closes = stock.historical_closes.slice();
-              closes[closes.length - 1] = newPrice;
-              const volumes = stock.historical_volumes.slice();
-              volumes[volumes.length - 1] = newVol;
-
-              const prevClose = closes[closes.length - 2] || newPrice;
-              const change = Math.round((newPrice - prevClose) * 100) / 100;
-              const change_pct = prevClose > 0 ? Math.round((change / prevClose) * 10000) / 100 : 0;
-
-              return {
-                ...stock,
-                price: newPrice,
-                change,
-                change_pct,
-                total_volume: newVol,
-                total_value: newVal,
-                historical_closes: closes,
-                historical_volumes: volumes
-              };
-            });
-          });
-
-          setLastUpdated(new Date());
-          return 5;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [isAutoRefresh]);
 
   // Execute quantitative calculation engine on RAM matrix (1,626 stocks)
   const evaluatedStocks = useMemo(() => {
@@ -463,8 +506,11 @@ export default function App() {
             <span>{isSyncing ? 'Đang đồng bộ...' : `Quy tắc & Đồng bộ (${universeStats.total.toLocaleString()} Mã)`}</span>
           </button>
           <div className="flex items-center gap-2 font-mono-numbers text-[11px] text-slate-400">
-            <span className={`w-2 h-2 rounded-full ${isAutoRefresh ? 'bg-emerald-400 animate-pulse' : 'bg-slate-600'}`} />
-            <span>Tick 5s ({countdown}s)</span>
+            <span className="text-emerald-400 font-semibold">VNDirect Live</span>
+            <span>·</span>
+            <span>
+              {cacheUpdatedAt ? `Lưu Cache: ${cacheUpdatedAt}` : `Phiên ${formatVnDateDisplay(lastSyncDate)}`}
+            </span>
           </div>
           <div className="h-4 w-px bg-slate-800" />
           <button
@@ -553,12 +599,17 @@ export default function App() {
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5 text-[10px] text-slate-400 mt-0.5 font-mono-numbers">
-                  <span className="flex items-center gap-1 text-slate-300">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-slate-300">
                     HOSE {universeStats.HOSE} · HNX {universeStats.HNX} · UPCoM {universeStats.UPCOM}
                   </span>
                   <span>·</span>
-                  <span className="text-purple-300 font-semibold font-sans">5s ({countdown}s)</span>
+                  <span className="text-emerald-400 font-semibold font-sans">
+                    {isSyncing
+                      ? `Lô ${batchProgress?.batchIndex || 1}/${batchProgress?.totalBatches || 37}`
+                      : cacheUpdatedAt
+                      ? `Đã lưu Cache`
+                      : `VNDirect`}
+                  </span>
                 </div>
               </div>
 
@@ -949,6 +1000,9 @@ export default function App() {
           batchProgress={batchProgress}
           universeBreakdown={universeStats}
           lastSyncDate={lastSyncDate}
+          cacheUpdatedAt={cacheUpdatedAt}
+          isRestoredFromCache={isRestoredFromCache}
+          onClearCache={handleClearCacheAndResync}
         />
       )}
     </div>

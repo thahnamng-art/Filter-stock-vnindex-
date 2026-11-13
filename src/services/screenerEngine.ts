@@ -185,7 +185,138 @@ export function computeMarketRsRankings(
   return rankMap;
 }
 
-// Full vectorized-style screener pass on all 1,626 stocks
+interface PrecomputedStockMetrics {
+  closes: number[];
+  volumes: number[];
+  len: number;
+  vLen: number;
+  evalPrice: number;
+  prevClose: number;
+  evalChange: number;
+  evalChangePct: number;
+  evalVolume: number;
+  evalValue: number;
+  rsi14: number;
+  mcdx: ReturnType<typeof computeMcdxValues>;
+  ma50: number;
+  ma200: number;
+  avgDailyVol10: number;
+  // Sub-caches for custom rule parameters on this stock + offsetDays
+  customRsiCache: Map<string, number>;
+  customMaCache: Map<string, { currMA: number; prevMA: number; cP: number; pP: number }>;
+  customMcdxCache: Map<string, ReturnType<typeof computeMcdxValues>>;
+  customVolAvgCache: Map<number, number>;
+}
+
+const stockMetricsWeakCache = new WeakMap<StockData, Map<number, PrecomputedStockMetrics>>();
+const marketRsWeakCache = new WeakMap<StockData[], Map<string, Map<string, number>>>();
+
+function getOrComputeStockMetrics(stock: StockData, offsetDays: number): PrecomputedStockMetrics {
+  let offsetMap = stockMetricsWeakCache.get(stock);
+  if (!offsetMap) {
+    offsetMap = new Map<number, PrecomputedStockMetrics>();
+    stockMetricsWeakCache.set(stock, offsetMap);
+  }
+
+  const existing = offsetMap.get(offsetDays);
+  if (existing) {
+    return existing;
+  }
+
+  const fullCloses = stock.historical_closes;
+  const fullVolumes = stock.historical_volumes;
+  const closes =
+    offsetDays > 0 && fullCloses.length > offsetDays + 20
+      ? fullCloses.slice(0, fullCloses.length - offsetDays)
+      : fullCloses;
+  const volumes =
+    offsetDays > 0 && fullVolumes.length > offsetDays + 2
+      ? fullVolumes.slice(0, fullVolumes.length - offsetDays)
+      : fullVolumes;
+
+  const len = closes.length;
+  const vLen = volumes.length;
+
+  const evalPrice = offsetDays > 0 ? closes[len - 1] : stock.price;
+  const prevClose = closes[len - 2] || evalPrice;
+  const evalChange =
+    offsetDays > 0 ? Math.round((evalPrice - prevClose) * 100) / 100 : stock.change;
+  const evalChangePct =
+    offsetDays > 0
+      ? prevClose > 0
+        ? Math.round((evalChange / prevClose) * 10000) / 100
+        : 0
+      : stock.change_pct;
+  const evalVolume =
+    offsetDays > 0 ? volumes[vLen - 1] || stock.total_volume : stock.total_volume;
+  const evalValue =
+    offsetDays > 0
+      ? Math.max(0.1, Math.round(((evalVolume * evalPrice * 1000) / 1e9) * 10) / 10)
+      : stock.total_value;
+
+  // Fast RSI(14) on recent 45 bars
+  const rsiSlice = len > 45 ? closes.slice(-45) : closes;
+  const rsiSeries = calculateRSI(rsiSlice, 14);
+  const rsi14 = rsiSeries[rsiSeries.length - 1];
+
+  const mcdx = computeMcdxValues(closes, 50, 50);
+
+  const ma50Pair = calculateLastTwoMA(closes, 50, 'SMA');
+  const ma200Pair = calculateLastTwoMA(closes, 200, 'SMA');
+
+  // Default 10-day average volume
+  const lookbackDays = 10;
+  const startVolIdx = Math.max(0, vLen - 1 - lookbackDays);
+  let volSum = 0;
+  let volCount = 0;
+  for (let i = startVolIdx; i < vLen - 1; i++) {
+    volSum += volumes[i];
+    volCount++;
+  }
+  const avgDailyVol10 = volCount > 0 ? volSum / volCount : evalVolume;
+
+  const customRsiCache = new Map<string, number>();
+  customRsiCache.set('14_1D', rsi14);
+
+  const customMaCache = new Map<string, { currMA: number; prevMA: number; cP: number; pP: number }>();
+  const cP1D = closes[len - 1];
+  const pP1D = closes[len - 2] || cP1D;
+  customMaCache.set('SMA_50_1D', { currMA: ma50Pair.currMA, prevMA: ma50Pair.prevMA, cP: cP1D, pP: pP1D });
+  customMaCache.set('SMA_200_1D', { currMA: ma200Pair.currMA, prevMA: ma200Pair.prevMA, cP: cP1D, pP: pP1D });
+
+  const customMcdxCache = new Map<string, ReturnType<typeof computeMcdxValues>>();
+  customMcdxCache.set('50_50', mcdx);
+
+  const customVolAvgCache = new Map<number, number>();
+  customVolAvgCache.set(10, avgDailyVol10);
+
+  const computed: PrecomputedStockMetrics = {
+    closes,
+    volumes,
+    len,
+    vLen,
+    evalPrice,
+    prevClose,
+    evalChange,
+    evalChangePct,
+    evalVolume,
+    evalValue,
+    rsi14,
+    mcdx,
+    ma50: ma50Pair.currMA,
+    ma200: ma200Pair.currMA,
+    avgDailyVol10,
+    customRsiCache,
+    customMaCache,
+    customMcdxCache,
+    customVolAvgCache
+  };
+
+  offsetMap.set(offsetDays, computed);
+  return computed;
+}
+
+// Full vectorized-style screener pass on all 1,626 stocks with WeakMap Indicator Cache
 export function evaluateScreener(
   stocks: StockData[],
   rules: AnyFilterRule[],
@@ -200,12 +331,18 @@ export function evaluateScreener(
       ? Math.max(0, Math.min(55, activeDateRule.offset_days || 0))
       : 0;
 
-  const rsCache = new Map<number, Map<string, number>>();
+  let rsCacheForUniverse = marketRsWeakCache.get(stocks);
+  if (!rsCacheForUniverse) {
+    rsCacheForUniverse = new Map<string, Map<string, number>>();
+    marketRsWeakCache.set(stocks, rsCacheForUniverse);
+  }
+
   const getRsMap = (days: number) => {
-    let m = rsCache.get(days);
+    const key = `${days}_${offsetDays}`;
+    let m = rsCacheForUniverse!.get(key);
     if (!m) {
       m = computeMarketRsRankings(stocks, days, offsetDays);
-      rsCache.set(days, m);
+      rsCacheForUniverse!.set(key, m);
     }
     return m;
   };
@@ -216,62 +353,32 @@ export function evaluateScreener(
   const sessionRatio = offsetDays > 0 ? 1.0 : sessionMinutes / TOTAL_SESSION_MINUTES;
 
   return stocks.map((stock) => {
-    const fullCloses = stock.historical_closes;
-    const fullVolumes = stock.historical_volumes;
-    const closes =
-      offsetDays > 0 && fullCloses.length > offsetDays + 20
-        ? fullCloses.slice(0, fullCloses.length - offsetDays)
-        : fullCloses;
-    const volumes =
-      offsetDays > 0 && fullVolumes.length > offsetDays + 2
-        ? fullVolumes.slice(0, fullVolumes.length - offsetDays)
-        : fullVolumes;
-
-    const len = closes.length;
-    const vLen = volumes.length;
-
-    // Historical or current session price, change, volume, and value
-    const evalPrice = offsetDays > 0 ? closes[len - 1] : stock.price;
-    const prevClose = closes[len - 2] || evalPrice;
-    const evalChange =
-      offsetDays > 0 ? Math.round((evalPrice - prevClose) * 100) / 100 : stock.change;
-    const evalChangePct =
-      offsetDays > 0
-        ? prevClose > 0
-          ? Math.round((evalChange / prevClose) * 10000) / 100
-          : 0
-        : stock.change_pct;
-    const evalVolume =
-      offsetDays > 0 ? volumes[vLen - 1] || stock.total_volume : stock.total_volume;
-    const evalValue =
-      offsetDays > 0
-        ? Math.max(0.1, Math.round(((evalVolume * evalPrice * 1000) / 1e9) * 10) / 10)
-        : stock.total_value;
+    const metrics = getOrComputeStockMetrics(stock, offsetDays);
+    const {
+      closes,
+      volumes,
+      len,
+      vLen,
+      evalPrice,
+      evalChange,
+      evalChangePct,
+      evalVolume,
+      evalValue,
+      rsi14,
+      mcdx,
+      ma50,
+      ma200,
+      avgDailyVol10,
+      customRsiCache,
+      customMaCache,
+      customMcdxCache,
+      customVolAvgCache
+    } = metrics;
 
     const rs52 = rs52Map.get(stock.symbol) || 50;
     const rs1m = rs1mMap.get(stock.symbol) || 50;
 
-    // Fast RSI(14) on recent 45 bars
-    const rsiSlice = len > 45 ? closes.slice(-45) : closes;
-    const rsiSeries = calculateRSI(rsiSlice, 14);
-    const rsi14 = rsiSeries[rsiSeries.length - 1];
-
-    const mcdx = computeMcdxValues(closes, 50, 50);
-
-    const { currMA: ma50 } = calculateLastTwoMA(closes, 50, 'SMA');
-    const { currMA: ma200 } = calculateLastTwoMA(closes, 200, 'SMA');
-
-    // Volume spike estimation (default 10-day lookback)
-    const lookbackDays = 10;
-    const startVolIdx = Math.max(0, vLen - 1 - lookbackDays);
-    let volSum = 0;
-    let volCount = 0;
-    for (let i = startVolIdx; i < vLen - 1; i++) {
-      volSum += volumes[i];
-      volCount++;
-    }
-    const avgDailyVol = volCount > 0 ? volSum / volCount : evalVolume;
-    const expectedIntradayVol = avgDailyVol * sessionRatio;
+    const expectedIntradayVol = avgDailyVol10 * sessionRatio;
     const volumeSpikeRatio =
       expectedIntradayVol > 0 ? Math.round((evalVolume / expectedIntradayVol) * 100) : 100;
 
@@ -309,33 +416,45 @@ export function evaluateScreener(
         }
         case 'RS': {
           const days = rule.period_type === 'WEEKS' ? rule.period_length * 5 : rule.period_length * 21;
-          const customMap = getRsMap(days);
+          const customMap = days === 260 ? rs52Map : days === 21 ? rs1mMap : getRsMap(days);
           const score = customMap.get(stock.symbol) || 50;
           passedThisRule = score >= rule.min_percentile && score <= rule.max_percentile;
           break;
         }
         case 'RSI': {
-          let testPrices = closes;
-          if (rule.timeframe === '1W') {
-            testPrices = closes.filter((_, idx) => idx % 5 === 0);
-          } else if (closes.length > rule.period * 3 + 10) {
-            testPrices = closes.slice(-(rule.period * 3 + 10));
+          const rsiKey = `${rule.period}_${rule.timeframe}`;
+          let currentRsi = customRsiCache.get(rsiKey);
+          if (currentRsi === undefined) {
+            let testPrices = closes;
+            if (rule.timeframe === '1W') {
+              testPrices = closes.filter((_, idx) => idx % 5 === 0);
+            } else if (closes.length > rule.period * 3 + 10) {
+              testPrices = closes.slice(-(rule.period * 3 + 10));
+            }
+            const dynamicRsiSeries = calculateRSI(testPrices, rule.period);
+            currentRsi = dynamicRsiSeries[dynamicRsiSeries.length - 1];
+            customRsiCache.set(rsiKey, currentRsi);
           }
-          const dynamicRsiSeries = calculateRSI(testPrices, rule.period);
-          const currentRsi = dynamicRsiSeries[dynamicRsiSeries.length - 1];
           passedThisRule = currentRsi >= rule.min_rsi && currentRsi <= rule.max_rsi;
           break;
         }
         case 'PRICE_VS_MA': {
-          let testPrices = closes;
-          if (rule.timeframe === '1W') {
-            testPrices = closes.filter((_, idx) => idx % 5 === 0);
+          const maKey = `${rule.ma_type}_${rule.period}_${rule.timeframe}`;
+          let cachedMa = customMaCache.get(maKey);
+          if (!cachedMa) {
+            let testPrices = closes;
+            if (rule.timeframe === '1W') {
+              testPrices = closes.filter((_, idx) => idx % 5 === 0);
+            }
+            const tLen = testPrices.length;
+            const cP = testPrices[tLen - 1];
+            const pP = testPrices[tLen - 2] || cP;
+            const { currMA, prevMA } = calculateLastTwoMA(testPrices, rule.period, rule.ma_type);
+            cachedMa = { currMA, prevMA, cP, pP };
+            customMaCache.set(maKey, cachedMa);
           }
-          const tLen = testPrices.length;
-          const cP = testPrices[tLen - 1];
-          const pP = testPrices[tLen - 2] || cP;
-          const { currMA: cMA, prevMA: pMA } = calculateLastTwoMA(testPrices, rule.period, rule.ma_type);
 
+          const { currMA: cMA, prevMA: pMA, cP, pP } = cachedMa;
           if (rule.operator === '>') passedThisRule = cP > cMA;
           else if (rule.operator === '>=') passedThisRule = cP >= cMA;
           else if (rule.operator === '<') passedThisRule = cP < cMA;
@@ -345,10 +464,14 @@ export function evaluateScreener(
           break;
         }
         case 'MCDX': {
-          const customMcdx =
-            rule.period_banker === 50 && rule.base_banker === 50
-              ? mcdx
-              : computeMcdxValues(closes, rule.period_banker || 50, rule.base_banker || 50);
+          const pB = rule.period_banker || 50;
+          const bB = rule.base_banker || 50;
+          const mcdxKey = `${pB}_${bB}`;
+          let customMcdx = customMcdxCache.get(mcdxKey);
+          if (!customMcdx) {
+            customMcdx = computeMcdxValues(closes, pB, bB);
+            customMcdxCache.set(mcdxKey, customMcdx);
+          }
 
           let compVal = customMcdx.banker;
           let prevCompVal = customMcdx.prevBanker;
@@ -372,10 +495,8 @@ export function evaluateScreener(
 
           let compPassed = false;
           if (rule.operator === 'CROSS_ABOVE') {
-            // Từ mức thấp (< threshold) trong lookback phiên trước cắt lên qua mức threshold (>= threshold)
             compPassed = compVal >= rule.threshold && minPrev < rule.threshold;
           } else if (rule.operator === 'CROSS_BELOW') {
-            // Từ mức cao (> threshold) trong lookback phiên trước cắt xuống dưới mức threshold (<= threshold)
             compPassed = compVal <= rule.threshold && maxPrev > rule.threshold;
           } else if (rule.operator === '>=') {
             compPassed = compVal >= rule.threshold;
@@ -393,14 +514,18 @@ export function evaluateScreener(
         }
         case 'VOLUME_SPIKE': {
           const ruleLookback = rule.lookback_days || 10;
-          const sIdx = Math.max(0, vLen - 1 - ruleLookback);
-          let sumV = 0;
-          let cntV = 0;
-          for (let i = sIdx; i < vLen - 1; i++) {
-            sumV += volumes[i];
-            cntV++;
+          let avgVol = customVolAvgCache.get(ruleLookback);
+          if (avgVol === undefined) {
+            const sIdx = Math.max(0, vLen - 1 - ruleLookback);
+            let sumV = 0;
+            let cntV = 0;
+            for (let i = sIdx; i < vLen - 1; i++) {
+              sumV += volumes[i];
+              cntV++;
+            }
+            avgVol = cntV > 0 ? sumV / cntV : evalVolume;
+            customVolAvgCache.set(ruleLookback, avgVol);
           }
-          const avgVol = cntV > 0 ? sumV / cntV : evalVolume;
           const expectedVol = avgVol * sessionRatio;
           const ratio = expectedVol > 0 ? (evalVolume / expectedVol) * 100 : 100;
 
@@ -441,3 +566,4 @@ export function evaluateScreener(
     };
   });
 }
+

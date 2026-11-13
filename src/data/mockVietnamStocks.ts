@@ -115,6 +115,50 @@ export interface SyncOptions {
   shouldAbort?: () => boolean;
   onProgress?: (completed: number, total: number) => void;
   onBatchProgress?: (progress: SyncBatchProgress) => void;
+  onIncrementalStocksUpdate?: (
+    stocksSnapshot: StockData[],
+    meta: { lastDate: string; liveHttpCount: number; processed: number; totalTarget: number }
+  ) => void;
+}
+
+async function fetchVNDirectHistoryWithFallback(
+  symbol: string,
+  from: number,
+  to: number,
+  timeoutMs: number
+): Promise<any | null> {
+  const targetUrl = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
+    symbol
+  )}&from=${from}&to=${to}`;
+
+  const tryFetch = async (url: string, ms: number) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      clearTimeout(timer);
+      return null;
+    }
+  };
+
+  // 1. Direct VNDirect DChart API call
+  const directData = await tryFetch(targetUrl, timeoutMs);
+  if (directData && directData.s === 'ok' && Array.isArray(directData.c)) {
+    return directData;
+  }
+
+  // 2. Fallback via CORS proxy if direct request was blocked by browser CORS policy
+  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
+  const proxyData = await tryFetch(proxyUrl, Math.min(timeoutMs + 800, 4200));
+  if (proxyData && proxyData.s === 'ok' && Array.isArray(proxyData.c)) {
+    return proxyData;
+  }
+
+  return null;
 }
 
 // Fast batched live sync from VNDirect dchart API across all 1,626 stocks on HOSE, HNX, UPCOM
@@ -146,22 +190,27 @@ export async function syncRealMarketDataFromVNDirect(
   const totalUniverse = currentStocks.length;
   const updatedStocks: StockData[] = [...currentStocks];
 
+  // Prioritize stocks by trading value (total_value descending) so high-liquidity stocks sync in the first batches
+  const allIndicesSortedByLiquidity = Array.from({ length: totalUniverse }, (_, i) => i).sort(
+    (a, b) => (updatedStocks[b].total_value || 0) - (updatedStocks[a].total_value || 0)
+  );
+
   // Determine which indices to actively query via HTTP based on selected SyncScopeMode
   const targetIndices: number[] = [];
   if (mode === 'FAST_200') {
     const limit = Math.min(200, totalUniverse);
-    for (let i = 0; i < limit; i++) targetIndices.push(i);
+    for (let i = 0; i < limit; i++) {
+      targetIndices.push(allIndicesSortedByLiquidity[i]);
+    }
   } else if (mode === 'BY_EXCHANGE') {
-    for (let i = 0; i < totalUniverse; i++) {
-      if (targetExchanges.includes(updatedStocks[i].exchange)) {
-        targetIndices.push(i);
+    for (const idx of allIndicesSortedByLiquidity) {
+      if (targetExchanges.includes(updatedStocks[idx].exchange)) {
+        targetIndices.push(idx);
       }
     }
   } else {
-    // FULL_1626: query all 1,626 stocks in batches of 45
-    for (let i = 0; i < totalUniverse; i++) {
-      targetIndices.push(i);
-    }
+    // FULL_1626: query all 1,626 stocks in batches of 45, starting from highest liquidity
+    targetIndices.push(...allIndicesSortedByLiquidity);
   }
 
   const totalTarget = targetIndices.length;
@@ -179,6 +228,7 @@ export async function syncRealMarketDataFromVNDirect(
     const batchSlice = targetIndices.slice(b, b + batchSize);
     const batchIndex = Math.floor(b / batchSize) + 1;
     const currentBatchSymbols = batchSlice.map((idx) => updatedStocks[idx].symbol);
+    let batchUpdatedAny = false;
 
     await Promise.all(
       batchSlice.map(async (idx) => {
@@ -186,59 +236,57 @@ export async function syncRealMarketDataFromVNDirect(
         const oldPrice = stock.price;
         const nowTime = new Date().toLocaleTimeString('vi-VN', { hour12: false });
 
-        try {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeoutMs);
-          const res = await fetch(
-            `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${stock.symbol}&from=${from}&to=${to}`,
-            { signal: controller.signal }
-          );
-          clearTimeout(timer);
-          const data = await res.json();
+        const data = await fetchVNDirectHistoryWithFallback(stock.symbol, from, to, timeoutMs);
 
-          if (data.s === 'ok' && data.c && data.c.length >= 20) {
-            const len = data.c.length;
-            const closes = data.c.slice(-260);
-            const volumes = data.v.slice(-20);
-            const currPrice = Math.round(closes[closes.length - 1] * 100) / 100;
-            const prevPrice = closes[closes.length - 2] || currPrice;
-            const change = Math.round((currPrice - prevPrice) * 100) / 100;
-            const change_pct = prevPrice > 0 ? Math.round((change / prevPrice) * 10000) / 100 : 0;
-            const totalVol = volumes[volumes.length - 1] || stock.total_volume;
-            const totalVal = Math.round(((totalVol * currPrice * 1000) / 1e9) * 10) / 10;
-            const finalVal = totalVal > 0 ? totalVal : stock.total_value;
+        if (data && data.s === 'ok' && data.c && data.c.length >= 20) {
+          const len = data.c.length;
+          const closes = data.c.slice(-260);
+          const volumes = Array.isArray(data.v) ? data.v.slice(-20) : stock.historical_volumes;
+          const currPrice = Math.round(closes[closes.length - 1] * 100) / 100;
+          const prevPrice = closes[closes.length - 2] || currPrice;
+          const change = Math.round((currPrice - prevPrice) * 100) / 100;
+          const change_pct = prevPrice > 0 ? Math.round((change / prevPrice) * 10000) / 100 : 0;
+          const totalVol = volumes[volumes.length - 1] || stock.total_volume;
+          const totalVal = Math.round(((totalVol * currPrice * 1000) / 1e9) * 10) / 10;
+          const finalVal = totalVal > 0 ? totalVal : stock.total_value;
 
-            lastTradingDate = new Date(data.t[len - 1] * 1000).toISOString().slice(0, 10);
-
-            updatedStocks[idx] = {
-              ...stock,
-              price: currPrice,
-              change,
-              change_pct,
-              total_volume: totalVol,
-              total_value: finalVal,
-              historical_closes: expandTo260Bars(closes, data.c[0]),
-              historical_volumes: volumes
-            };
-
-            liveUpdatedCount++;
-            exchangeDone[stock.exchange]++;
-            recentLogs.unshift({
-              symbol: stock.symbol,
-              exchange: stock.exchange,
-              oldPrice,
-              newPrice: currPrice,
-              changePct: change_pct,
-              totalVolume: totalVol,
-              totalValue: finalVal,
-              barsCount: Math.min(260, len),
-              status: 'LIVE_HTTP',
-              timestamp: nowTime
-            });
-            return;
+          if (Array.isArray(data.t) && data.t.length > 0) {
+            const latestTs = data.t[len - 1];
+            if (latestTs) {
+              const dtStr = new Date(latestTs * 1000).toISOString().slice(0, 10);
+              if (dtStr > lastTradingDate || lastTradingDate === getVietnamTodayDateStr()) {
+                lastTradingDate = dtStr;
+              }
+            }
           }
-        } catch {
-          // Fallback to embedded real VNDirect OHLCV snapshot
+
+          updatedStocks[idx] = {
+            ...stock,
+            price: currPrice,
+            change,
+            change_pct,
+            total_volume: totalVol,
+            total_value: finalVal,
+            historical_closes: expandTo260Bars(closes, data.c[0]),
+            historical_volumes: volumes
+          };
+
+          batchUpdatedAny = true;
+          liveUpdatedCount++;
+          exchangeDone[stock.exchange]++;
+          recentLogs.unshift({
+            symbol: stock.symbol,
+            exchange: stock.exchange,
+            oldPrice,
+            newPrice: currPrice,
+            changePct: change_pct,
+            totalVolume: totalVol,
+            totalValue: finalVal,
+            barsCount: Math.min(260, len),
+            status: 'LIVE_HTTP',
+            timestamp: nowTime
+          });
+          return;
         }
 
         fallbackCount++;
@@ -280,6 +328,20 @@ export async function syncRealMarketDataFromVNDirect(
         exchangeDone: { ...exchangeDone }
       });
     }
+
+    // Progressive streaming update: emit after batch 1, every 3 batches, or final batch
+    if (
+      opts.onIncrementalStocksUpdate &&
+      (batchIndex === 1 || batchIndex % 3 === 0 || processed === totalTarget) &&
+      batchUpdatedAny
+    ) {
+      opts.onIncrementalStocksUpdate([...updatedStocks], {
+        lastDate: lastTradingDate,
+        liveHttpCount: liveUpdatedCount,
+        processed,
+        totalTarget
+      });
+    }
   }
 
   const breakdown = getExchangeBreakdown(updatedStocks);
@@ -297,3 +359,4 @@ export async function syncRealMarketDataFromVNDirect(
     logs: recentLogs
   };
 }
+
