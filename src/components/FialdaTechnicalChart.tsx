@@ -45,6 +45,9 @@ import { StockData, TimeFrame } from '../types/screener';
 import {
   computeFullTechnicalChart,
   fetchLiveOhlcvFromVNDirect,
+  extendSymbolHistoryByOneYear,
+  getSymbolYearsLoaded,
+  MAX_CHART_HISTORY_YEARS,
   OhlcvCandle,
   MARKET_INDEX_STOCKS,
   resolveStockOrMarketIndex
@@ -212,11 +215,20 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
     vnindex: true
   });
 
-  // Live VNDirect OHLCV state
+  // Independent Buy & Sell Signal Toggles
+  // Buy Signal = Default Filter + MCDX Banker crosses above 25 / 50 / 75
+  // Sell Signal = Independent MCDX Banker crosses below 75 / 50 / 25
+  const [showBuySignals, setShowBuySignals] = useState<boolean>(true);
+  const [showSellSignals, setShowSellSignals] = useState<boolean>(true);
+
+  // Live VNDirect OHLCV state + per-symbol multi-year local cache state
   const [liveCandles, setLiveCandles] = useState<OhlcvCandle[] | null>(null);
   const [isLoadingLive, setIsLoadingLive] = useState<boolean>(false);
+  const [yearsLoaded, setYearsLoaded] = useState<number>(1);
+  const [isExtendingHistory, setIsExtendingHistory] = useState<boolean>(false);
+  const lastAutoExtendTotalRef = useRef<number>(0);
 
-  // Fetch live OHLCV from VNDirect whenever selectedStock.symbol changes
+  // Fetch live or locally cached multi-year OHLCV whenever selectedStock.symbol changes
   useEffect(() => {
     let cancelled = false;
     setPanOffset(-6);
@@ -225,17 +237,21 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
     setPriceVerticalOffset(0);
     setHoverIndex(null);
     setIsLoadingLive(true);
+    setIsExtendingHistory(false);
+    lastAutoExtendTotalRef.current = 0;
 
-    fetchLiveOhlcvFromVNDirect(selectedStock.symbol, 2600)
+    fetchLiveOhlcvFromVNDirect(selectedStock.symbol, 2600, selectedStock)
       .then((candles) => {
         if (!cancelled) {
           setLiveCandles(candles);
+          setYearsLoaded(getSymbolYearsLoaded(selectedStock.symbol));
           setIsLoadingLive(false);
         }
       })
       .catch(() => {
         if (!cancelled) {
           setLiveCandles(null);
+          setYearsLoaded(1);
           setIsLoadingLive(false);
         }
       });
@@ -263,8 +279,28 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
     );
   }, [chartData.points.length]);
 
+  // On-demand +1 Year history loader for ONLY the active symbol (persisted to browser IndexedDB)
+  const handleExtendOneMoreYear = async (panFurtherBars: number = 0) => {
+    if (isExtendingHistory || yearsLoaded >= MAX_CHART_HISTORY_YEARS) return;
+    setIsExtendingHistory(true);
+    try {
+      const res = await extendSymbolHistoryByOneYear(selectedStock, 2800);
+      if (res.addedBars > 0) {
+        setLiveCandles([...res.candles]);
+        setYearsLoaded(res.yearsLoaded);
+        if (panFurtherBars > 0) {
+          setPanOffset((prev) => prev + panFurtherBars);
+        }
+      } else {
+        setYearsLoaded(res.yearsLoaded);
+      }
+    } finally {
+      setIsExtendingHistory(false);
+    }
+  };
+
   // Slice visible window + calculate future blank bars on the right when panOffset < 0
-  const { visiblePoints, futureBlankBars, totalSlots } = useMemo(() => {
+  const { visiblePoints, futureBlankBars, totalSlots, visibleStartIdx } = useMemo(() => {
     const total = chartData.points.length;
     if (panOffset < 0) {
       const blank = Math.min(Math.floor(visibleBarsCount * 0.82), -panOffset);
@@ -274,7 +310,8 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
       return {
         visiblePoints: slice,
         futureBlankBars: blank,
-        totalSlots: slice.length + blank
+        totalSlots: slice.length + blank,
+        visibleStartIdx: startIdx
       };
     } else {
       const endIdx = Math.max(10, total - panOffset);
@@ -283,10 +320,34 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
       return {
         visiblePoints: slice,
         futureBlankBars: 0,
-        totalSlots: Math.max(1, slice.length)
+        totalSlots: Math.max(1, slice.length),
+        visibleStartIdx: startIdx
       };
     }
   }, [chartData.points, visibleBarsCount, panOffset]);
+
+  // Automatically load +1 year for this symbol when the user pans/scrolls near the oldest loaded bar
+  useEffect(() => {
+    const total = chartData.points.length;
+    if (
+      panOffset > 15 &&
+      visibleStartIdx <= 18 &&
+      yearsLoaded < MAX_CHART_HISTORY_YEARS &&
+      !isExtendingHistory &&
+      !isLoadingLive &&
+      lastAutoExtendTotalRef.current !== total
+    ) {
+      lastAutoExtendTotalRef.current = total;
+      void handleExtendOneMoreYear(0);
+    }
+  }, [
+    panOffset,
+    visibleStartIdx,
+    chartData.points.length,
+    yearsLoaded,
+    isExtendingHistory,
+    isLoadingLive
+  ]);
 
   // Active point for legend & axis readouts (either hovered bar or latest visible bar)
   const activePoint = useMemo(() => {
@@ -1262,6 +1323,37 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
             <span className="text-[10px] text-slate-400 font-mono tabular-nums">{visibleBarsCount} nến</span>
           </button>
 
+          {/* Independent Buy & Sell Signal Quick Toggles */}
+          <div className="flex items-center gap-1 px-1.5 py-0.5">
+            <button
+              type="button"
+              onClick={() => setShowBuySignals((prev) => !prev)}
+              className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-1 transition-colors border ${
+                showBuySignals
+                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50'
+                  : 'bg-[#181c27] text-slate-500 border-[#262b38] hover:text-slate-300'
+              }`}
+              title="Bật/Tắt Tín hiệu MUA độc lập (Thỏa mãn Filter mặc định + MCDX Banker cắt lên 25, 50, 75)"
+            >
+              <span className="text-[9px] leading-none">▲</span>
+              <span>Mua</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowSellSignals((prev) => !prev)}
+              className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-1 transition-colors border ${
+                showSellSignals
+                  ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
+                  : 'bg-[#181c27] text-slate-500 border-[#262b38] hover:text-slate-300'
+              }`}
+              title="Bật/Tắt Tín hiệu BÁN độc lập (Khi MCDX hiện tại rớt >25% so với đỉnh MCDX 10 phiên trước)"
+            >
+              <span className="text-[9px] leading-none">▼</span>
+              <span>Bán</span>
+            </button>
+          </div>
+
           {/* fx Indicators Visibility Menu */}
           <div className="relative">
             <button
@@ -1276,10 +1368,10 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
             </button>
 
             {isFxMenuOpen && (
-              <div className="absolute right-0 top-9 w-60 bg-[#181d2b] border border-[#2b344a] rounded-xl shadow-2xl p-2.5 z-50 space-y-1">
+              <div className="absolute right-0 top-9 w-64 bg-[#181d2b] border border-[#2b344a] rounded-xl shadow-2xl p-2.5 z-50 space-y-1">
                 <div className="flex items-center justify-between px-1 pb-1.5 border-b border-[#252d40]">
                   <span className="text-[11px] font-bold text-slate-200">
-                    Các tầng chỉ báo kỹ thuật (7 Tầng)
+                    Các tầng chỉ báo &amp; Tín hiệu
                   </span>
                   <button
                     type="button"
@@ -1289,6 +1381,30 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                     <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
+
+                {/* Independent Buy & Sell Toggles inside fx menu */}
+                <button
+                  type="button"
+                  onClick={() => setShowBuySignals((prev) => !prev)}
+                  className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg text-[11px] hover:bg-[#222a3d] transition-colors"
+                >
+                  <span className={showBuySignals ? 'text-emerald-300 font-semibold' : 'text-slate-500'}>
+                    ▲ Tín hiệu Mua (Filter + MCDX ↑25/50/75)
+                  </span>
+                  <span className={`w-2 h-2 rounded-full ${showBuySignals ? 'bg-emerald-400' : 'bg-slate-600'}`} />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowSellSignals((prev) => !prev)}
+                  className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg text-[11px] hover:bg-[#222a3d] transition-colors border-b border-[#252d40] pb-2 mb-1"
+                >
+                  <span className={showSellSignals ? 'text-rose-300 font-semibold' : 'text-slate-500'}>
+                    ▼ Tín hiệu Bán (MCDX giảm &gt;25% từ đỉnh 10P)
+                  </span>
+                  <span className={`w-2 h-2 rounded-full ${showSellSignals ? 'bg-rose-400' : 'bg-slate-600'}`} />
+                </button>
+
                 {[
                   { key: 'macd', label: 'MACD (12, 26, 9 EMA)' },
                   { key: 'ma', label: 'MA 30 / MA 50 / MA 200' },
@@ -1327,9 +1443,15 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
           <div className="flex items-center">
             <button
               type="button"
-              onClick={() => setPanOffset((prev) => Math.min(maxPanOffset, prev + 15))}
+              onClick={() => {
+                if (visibleStartIdx <= 20 && yearsLoaded < MAX_CHART_HISTORY_YEARS) {
+                  void handleExtendOneMoreYear(15);
+                } else {
+                  setPanOffset((prev) => Math.min(maxPanOffset, prev + 15));
+                }
+              }}
               className="px-2 py-1 text-[#b2b5be] hover:text-white hover:bg-[#1e222d]"
-              title="Lùi về quá khứ 15 phiên"
+              title="Lùi về quá khứ 15 phiên (Tự động tải thêm +1 năm khi chạm biên trái)"
             >
               <Undo2 className="w-3.5 h-3.5" />
             </button>
@@ -1882,23 +2004,87 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                       Đạt {selectedStock.passed_rules_count ?? activeRulesCount}/{activeRulesCount} lọc
                     </button>
                   )}
+                  <span
+                    className={`px-1.5 py-0.2 rounded text-[9px] font-semibold border ${
+                      isExtendingHistory
+                        ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 animate-pulse'
+                        : yearsLoaded > 1
+                        ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                        : 'bg-slate-800/80 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    {isExtendingHistory
+                      ? `Đang tải thêm +1 năm cho ${selectedStock.symbol}...`
+                      : `Local: ${yearsLoaded} năm (${chartData.points.length} phiên)`}
+                  </span>
                 </div>
 
-                {/* Live Price + Change + % */}
+                {/* Live Price + Change + % + Active Signal Readout */}
                 <div
-                  className={`text-xs font-semibold tabular-nums ${
+                  className={`text-xs font-semibold tabular-nums flex flex-wrap items-center gap-1.5 ${
                     isUp ? 'text-[#26a69a]' : 'text-[#ef5350]'
                   }`}
                 >
-                  {activePoint.close.toFixed(2)}{' '}
-                  {priceDiff >= 0 ? `+${priceDiff.toFixed(2)}` : priceDiff.toFixed(2)} (
-                  {priceDiffPct >= 0 ? `+${priceDiffPct.toFixed(2)}%` : `${priceDiffPct.toFixed(2)}%`})
+                  <span>
+                    {activePoint.close.toFixed(2)}{' '}
+                    {priceDiff >= 0 ? `+${priceDiff.toFixed(2)}` : priceDiff.toFixed(2)} (
+                    {priceDiffPct >= 0 ? `+${priceDiffPct.toFixed(2)}%` : `${priceDiffPct.toFixed(2)}%`})
+                  </span>
+                  {showBuySignals && activePoint.buySignalLevel && (
+                    <span
+                      className={`px-1.5 py-0.2 rounded text-[9px] font-bold tracking-tight ${
+                        activePoint.buySignalLevel === 75
+                          ? 'bg-fuchsia-500/90 text-white'
+                          : activePoint.buySignalLevel === 50
+                          ? 'bg-cyan-400/90 text-slate-950'
+                          : 'bg-emerald-500/90 text-slate-950'
+                      }`}
+                    >
+                      ▲ MUA B{activePoint.buySignalLevel} (Filter + MCDX ↑{activePoint.buySignalLevel})
+                    </span>
+                  )}
+                  {showSellSignals && activePoint.sellSignalLevel && (
+                    <span
+                      className={`px-1.5 py-0.2 rounded text-[9px] font-bold tracking-tight ${
+                        activePoint.sellSignalLevel >= 50
+                          ? 'bg-rose-600/90 text-white'
+                          : activePoint.sellSignalLevel >= 35
+                          ? 'bg-orange-500/90 text-white'
+                          : 'bg-amber-400/90 text-slate-950'
+                      }`}
+                    >
+                      ▼ BÁN -{activePoint.sellSignalLevel}% (MCDX {activePoint.mcdxBanker.toFixed(1)} vs Đỉnh 10P:{' '}
+                      {activePoint.sellSignalPeak10?.toFixed(1)})
+                    </span>
+                  )}
                   {hoverIndex !== null && (
-                    <span className="ml-2 text-[10px] text-slate-400 font-normal">
+                    <span className="text-[10px] text-slate-400 font-normal">
                       [{activePoint.dateStr} · O:{activePoint.open.toFixed(2)} H:{activePoint.high.toFixed(2)} L:{activePoint.low.toFixed(2)}]
                     </span>
                   )}
                 </div>
+
+                {/* Compact Color Key for Buy & Sell Signals */}
+                {(showBuySignals || showSellSignals) && !collapseMaLegend && (
+                  <div className="flex flex-wrap items-center gap-2 text-[9px] text-slate-400 pt-0.5">
+                    {showBuySignals && (
+                      <span className="inline-flex items-center gap-1">
+                        <span className="text-slate-300 font-semibold">Mua:</span>
+                        <span className="text-emerald-400 font-bold">▲25</span>
+                        <span className="text-cyan-300 font-bold">▲50</span>
+                        <span className="text-fuchsia-400 font-bold">▲75</span>
+                      </span>
+                    )}
+                    {showSellSignals && (
+                      <span className="inline-flex items-center gap-1">
+                        <span className="text-slate-300 font-semibold">Bán (MCDX -25% Đỉnh 10P):</span>
+                        <span className="text-amber-400 font-bold">▼-25%</span>
+                        <span className="text-orange-400 font-bold">▼-35%</span>
+                        <span className="text-rose-400 font-bold">▼-50%+</span>
+                      </span>
+                    )}
+                  </div>
+                )}
 
                 {/* MA & BB Legend Stack */}
                 {!collapseMaLegend && (
@@ -2128,6 +2314,93 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                   />
                 )}
               </svg>
+
+              {/* Compact Independent Buy & Sell Signal Icons Overlay on Price Chart */}
+              {(showBuySignals || showSellSignals) && (
+                <div className="absolute inset-0 pointer-events-none overflow-hidden z-[6]">
+                  {visiblePoints.map((p, i) => {
+                    const hasBuy = showBuySignals && p.buySignalLevel !== null;
+                    const hasSell = showSellSignals && p.sellSignalLevel !== null;
+                    if (!hasBuy && !hasSell) return null;
+
+                    const leftPct = ((i * stepX + stepX / 2) / SVG_W) * 100;
+                    const lowYPct = Math.min(93, Math.max(6, (toPriceY(p.low) / priceH) * 100));
+                    const highYPct = Math.max(6, Math.min(93, (toPriceY(p.high) / priceH) * 100));
+
+                    return (
+                      <React.Fragment key={`sig-${i}`}>
+                        {/* Independent BUY Signal Marker (below candle low) */}
+                        {hasBuy && p.buySignalLevel && (
+                          <div
+                            style={{
+                              left: `${leftPct}%`,
+                              top: `${lowYPct}%`
+                            }}
+                            className="absolute -translate-x-1/2 translate-y-1 flex flex-col items-center leading-none select-none"
+                          >
+                            <span
+                              className={`text-[9px] leading-none drop-shadow ${
+                                p.buySignalLevel === 75
+                                  ? 'text-fuchsia-400'
+                                  : p.buySignalLevel === 50
+                                  ? 'text-cyan-300'
+                                  : 'text-emerald-400'
+                              }`}
+                            >
+                              ▲
+                            </span>
+                            <span
+                              className={`px-1 py-[0.5px] rounded-[3px] text-[7.5px] font-extrabold tracking-tighter shadow-xs ${
+                                p.buySignalLevel === 75
+                                  ? 'bg-fuchsia-500/95 text-white'
+                                  : p.buySignalLevel === 50
+                                  ? 'bg-cyan-400/95 text-slate-950'
+                                  : 'bg-emerald-500/95 text-slate-950'
+                              }`}
+                            >
+                              {p.buySignalLevel}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* Independent SELL Signal Marker (above candle high: MCDX drops >25% from 10-bar peak) */}
+                        {hasSell && p.sellSignalLevel && (
+                          <div
+                            style={{
+                              left: `${leftPct}%`,
+                              top: `${highYPct}%`
+                            }}
+                            className="absolute -translate-x-1/2 -translate-y-[calc(100%+4px)] flex flex-col items-center leading-none select-none"
+                          >
+                            <span
+                              className={`px-1 py-[0.5px] rounded-[3px] text-[7px] font-extrabold tracking-tighter shadow-xs ${
+                                p.sellSignalLevel >= 50
+                                  ? 'bg-rose-600/95 text-white'
+                                  : p.sellSignalLevel >= 35
+                                  ? 'bg-orange-500/95 text-white'
+                                  : 'bg-amber-400/95 text-slate-950'
+                              }`}
+                            >
+                              -{p.sellSignalLevel}%
+                            </span>
+                            <span
+                              className={`text-[9px] leading-none drop-shadow ${
+                                p.sellSignalLevel >= 50
+                                  ? 'text-rose-500'
+                                  : p.sellSignalLevel >= 35
+                                  ? 'text-orange-400'
+                                  : 'text-amber-400'
+                              }`}
+                            >
+                              ▼
+                            </span>
+                          </div>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+              )}
 
               {/* Floating `[SYMBOL]` tag right next to the right axis */}
               <div
@@ -2689,6 +2962,54 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                     />
                   )}
                 </svg>
+
+                {/* Compact Crossover Dots on MCDX Pane (25 / 50 / 75 lines) */}
+                {(showBuySignals || showSellSignals) && (
+                  <div className="absolute inset-0 pointer-events-none overflow-hidden z-10">
+                    {visiblePoints.map((p, i) => {
+                      const hasBuy = showBuySignals && p.buySignalLevel !== null;
+                      const hasSell = showSellSignals && p.sellSignalLevel !== null;
+                      if (!hasBuy && !hasSell) return null;
+
+                      const leftPct = ((i * stepX + stepX / 2) / SVG_W) * 100;
+
+                      return (
+                        <React.Fragment key={`mcdx-sig-${i}`}>
+                          {hasBuy && p.buySignalLevel && (
+                            <div
+                              style={{
+                                left: `${leftPct}%`,
+                                top: `${(toMcdxY(p.buySignalLevel) / mcdxH) * 100}%`
+                              }}
+                              className={`absolute -translate-x-1/2 -translate-y-1/2 w-2 h-2 rounded-full ring-1 ring-slate-950 shadow ${
+                                p.buySignalLevel === 75
+                                  ? 'bg-fuchsia-400'
+                                  : p.buySignalLevel === 50
+                                  ? 'bg-cyan-300'
+                                  : 'bg-emerald-400'
+                              }`}
+                            />
+                          )}
+                          {hasSell && p.sellSignalLevel && (
+                            <div
+                              style={{
+                                left: `${leftPct}%`,
+                                top: `${(toMcdxY(p.mcdxBanker) / mcdxH) * 100}%`
+                              }}
+                              className={`absolute -translate-x-1/2 -translate-y-1/2 w-2 h-2 rounded-full ring-1 ring-slate-950 shadow ${
+                                p.sellSignalLevel >= 50
+                                  ? 'bg-rose-500'
+                                  : p.sellSignalLevel >= 35
+                                  ? 'bg-orange-400'
+                                  : 'bg-amber-300'
+                              }`}
+                            />
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               <div
                 onMouseDown={(e) => handlePaneAxisMouseDown('mcdx', e)}
@@ -2858,24 +3179,49 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
               ))}
             </div>
 
-            {/* Left: Step Backward into History */}
+            {/* Left: Step Backward into History & On-Demand +1 Year Loader */}
             <div className="flex items-center gap-1 shrink-0">
               <button
                 type="button"
-                onClick={() => setPanOffset((prev) => Math.min(maxPanOffset, prev + 22))}
+                onClick={() => {
+                  if (visibleStartIdx <= 25 && yearsLoaded < MAX_CHART_HISTORY_YEARS) {
+                    void handleExtendOneMoreYear(22);
+                  } else {
+                    setPanOffset((prev) => Math.min(maxPanOffset, prev + 22));
+                  }
+                }}
                 className="px-1.5 py-0.5 rounded bg-[#1b2232] hover:bg-purple-600/40 text-[10px] font-semibold text-slate-200 flex items-center gap-0.5 transition-colors"
-                title="Lùi về quá khứ 1 tháng (22 phiên)"
+                title="Lùi về quá khứ 1 tháng (22 phiên) — Tự động tải thêm +1 năm khi chạm biên trái"
               >
                 <ChevronLeft className="w-3 h-3" />
                 <span>1T</span>
               </button>
               <button
                 type="button"
-                onClick={() => setPanOffset((prev) => Math.min(maxPanOffset, prev + 7))}
+                onClick={() => {
+                  if (visibleStartIdx <= 15 && yearsLoaded < MAX_CHART_HISTORY_YEARS) {
+                    void handleExtendOneMoreYear(7);
+                  } else {
+                    setPanOffset((prev) => Math.min(maxPanOffset, prev + 7));
+                  }
+                }}
                 className="px-1.5 py-0.5 rounded bg-[#1b2232] hover:bg-purple-600/40 text-[10px] font-semibold text-slate-200 transition-colors"
                 title="Lùi 7 phiên"
               >
                 -7P
+              </button>
+              <button
+                type="button"
+                disabled={isExtendingHistory || yearsLoaded >= MAX_CHART_HISTORY_YEARS}
+                onClick={() => void handleExtendOneMoreYear(30)}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-bold transition-colors ${
+                  yearsLoaded >= MAX_CHART_HISTORY_YEARS
+                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                    : 'bg-emerald-600/30 border border-emerald-500/40 hover:bg-emerald-600/50 text-emerald-200'
+                }`}
+                title={`Tải thêm +1 năm dữ liệu lịch sử cho riêng mã ${selectedStock.symbol} và lưu cố định vào trình duyệt (Hiện có: ${yearsLoaded} năm)`}
+              >
+                {isExtendingHistory ? 'Đang tải...' : `+1 Năm (${yearsLoaded}N)`}
               </button>
             </div>
 

@@ -161,6 +161,88 @@ export async function saveCachedMarketUniverse(payload: {
   }
 }
 
+export interface CachedSymbolOhlcvCandle {
+  timestamp: number;
+  dateStr: string;
+  shortDate: string;
+  monthLabel?: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface CachedSymbolOhlcvRecord {
+  symbol: string;
+  candles: CachedSymbolOhlcvCandle[];
+  yearsLoaded: number;
+  updatedAt: string;
+}
+
+const SYMBOL_OHLCV_PREFIX = 'symbol_ohlcv_v1_';
+
+export async function loadCachedSymbolOhlcv(
+  symbol: string
+): Promise<CachedSymbolOhlcvRecord | null> {
+  const cleanSym = symbol.trim().toUpperCase();
+  if (!cleanSym) return null;
+
+  try {
+    const db = await openMarketCacheDB();
+    return await new Promise<CachedSymbolOhlcvRecord | null>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(`${SYMBOL_OHLCV_PREFIX}${cleanSym}`);
+
+      req.onsuccess = () => {
+        const result = req.result as CachedSymbolOhlcvRecord | undefined;
+        if (result && Array.isArray(result.candles) && result.candles.length >= 25) {
+          resolve(result);
+        } else {
+          resolve(null);
+        }
+      };
+
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => db.close();
+    });
+  } catch {
+    return null;
+  }
+}
+
+export async function saveCachedSymbolOhlcv(
+  symbol: string,
+  candles: CachedSymbolOhlcvCandle[],
+  yearsLoaded: number
+): Promise<void> {
+  const cleanSym = symbol.trim().toUpperCase();
+  if (!cleanSym || !Array.isArray(candles) || candles.length === 0) return;
+
+  const record: CachedSymbolOhlcvRecord = {
+    symbol: cleanSym,
+    candles,
+    yearsLoaded: Math.max(1, yearsLoaded),
+    updatedAt: new Date().toISOString()
+  };
+
+  try {
+    const db = await openMarketCacheDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.put(record, `${SYMBOL_OHLCV_PREFIX}${cleanSym}`);
+
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => db.close();
+    });
+  } catch {
+    // ignore IndexedDB quota or private browsing errors
+  }
+}
+
 export async function clearCachedMarketUniverse(): Promise<void> {
   try {
     localStorage.removeItem(META_STORAGE_KEY);
@@ -173,7 +255,7 @@ export async function clearCachedMarketUniverse(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
-      const req = store.delete(CACHE_KEY);
+      const req = store.clear();
 
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
@@ -183,3 +265,4 @@ export async function clearCachedMarketUniverse(): Promise<void> {
     // ignore
   }
 }
+

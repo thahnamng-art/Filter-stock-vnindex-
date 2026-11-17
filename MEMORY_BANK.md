@@ -100,3 +100,20 @@
   - Khi bật/tắt điều kiện lọc hoặc chỉnh sửa ngưỡng lọc, thời gian đánh giá 1.626 mã giảm từ `~90ms` xuống `< 1.5ms` (phản hồi tức thì 60fps).
 - **5. Biểu đồ Mặc định (`VNINDEX`):**
   - Thiết lập mã mặc định khi mở tab Biểu đồ Kỹ thuật (`chartSymbol` trong `src/App.tsx`) là chỉ số **`VNINDEX`** (thay vì `CDC`), giúp người dùng xem ngay tổng quan thị trường chung khi vừa mở biểu đồ.
+
+### [2026-11-13] Khởi động lại Dev Server sau khi Container ngủ đông (Dev Server Recovery)
+- **Nguyên nhân:** Container tự động giải phóng `node_modules` sau khoảng thời gian nghỉ giữa các phiên làm việc.
+- **Giải pháp:** Chạy `install_applet_dependencies` để nạp lại các gói phụ thuộc, kiểm tra build/lint và khởi động lại Vite Dev Server trên cổng `3000`.
+
+### [2026-11-17] Tín Hiệu Mua & Bán Độc Lập Ngay Trên Biểu Đồ + Tự Phục Hồi Dev Server
+- **1. Hai hệ thống Tín hiệu MUA và BÁN hoàn toàn độc lập (`src/services/technicalChartService.ts` & `src/components/FialdaTechnicalChart.tsx`):**
+  - **Tín hiệu MUA (`buySignalLevel: 25 | 50 | 75 | null`):** Thỏa mãn đồng thời các tiêu chí kỹ thuật của Bộ lọc mặc định (`Giá > SMA50`, `Giá > SMA200`, `RSI 14 >= 44.26`, `Khối lượng >= 100% SMA10`, biến động `[-30%, +50%]`) **KẾT HỢP** với **MCDX Banker cắt từ dưới lên qua các mốc `25`, `50`, hoặc `75`**. Hiển thị biểu tượng nhỏ gọn phía dưới chân nến với 3 màu phân cấp: `▲25` (Xanh lá `#10b981`), `▲50` (Xanh ngọc `#06b6d4`), `▲75` (Tím hồng `#d946ef`).
+  - **Tín hiệu BÁN (`sellSignalLevel: number | null`, `sellSignalPeak10: number | null`):** Hoạt động hoàn toàn độc lập với tín hiệu Mua — lấy giá trị `MCDX Banker` cao nhất trong vòng **10 phiên liền trước** (`maxPrev10Banker`), nếu `MCDX Banker` hiện tại **rớt xuống bé hơn 25% so với đỉnh 10 phiên này** (`currBanker < maxPrev10Banker * 0.75`, tức mức sụt giảm dòng tiền cá mập `> 25%` từ đỉnh 10 phiên) thì phát tín hiệu Bán. Hiển thị biểu tượng nhỏ gọn `-% ▼` phía trên đỉnh nến theo mức độ sụt giảm: `▼ -25%..-34%` (Vàng cam `#f59e0b`), `▼ -35%..-49%` (Cam đỏ `#f97316`), `▼ -50%+` (Đỏ tươi `#ef4444`).
+  - **Đồng bộ chấm màu trên tầng MCDX & Nút bật/tắt độc lập:** Hiển thị chấm màu nhỏ tại đúng vị trí cột MCDX xảy ra tín hiệu Mua/Bán trên tầng MCDX và trang bị 2 nút bật/tắt độc lập `▲ Mua` / `▼ Bán` ngay trên thanh công cụ biểu đồ.
+- **2. Cơ chế tự động khôi phục `node_modules` khi Container thức dậy (`package.json`):**
+  - Nâng cấp script `"dev": "([ -x node_modules/.bin/vite ] || npm install --no-audit --no-fund) && vite --port=3000 --host=0.0.0.0"` để tự động cài đặt lại thư viện nếu container vừa ngủ đông dậy.
+- **3. Mở rộng Lịch sử Biểu đồ từng năm theo yêu cầu (`+1 Năm` khi kéo biểu đồ) & Lưu Cố định vào IndexedDB (`src/services/marketCacheStorage.ts`, `src/services/technicalChartService.ts`, `src/components/FialdaTechnicalChart.tsx`):**
+  - **Đồng bộ thị trường mặc định giữ nguyên:** Toàn bộ luồng tải dữ liệu thị trường chung và lần mở đầu tiên của các mã vẫn chỉ tải **1 năm (~260 phiên)** để đảm bảo tốc độ tối đa.
+  - **Kéo biểu đồ tự động tải thêm `+1 năm` cho riêng mã đang xem:** Khi người dùng kéo/cuộn biểu đồ về phía quá khứ chạm gần biên trái (`visibleStartIdx <= 18`) hoặc bấm nút lùi/`+1 Năm`, hệ thống chỉ gọi tải nối tiếp thêm **1 năm quá khứ trước đó** (`extendSymbolHistoryByOneYear`, tối đa 10 năm / ~2.600 phiên) cho đúng mã cổ phiếu đang mở mà không làm nhảy vị trí khung nhìn hiện tại.
+  - **Lưu cố định vào IndexedDB trình duyệt (`symbol_ohlcv_v1_<SYMBOL>`):** Toàn bộ dữ liệu nhiều năm của mã đó được lưu trực tiếp vào IndexedDB trình duyệt. Những lần mở lại sau (kể cả khi tắt/mở lại trình duyệt), hệ thống tái sử dụng ngay lập tức toàn bộ số năm đã lưu từ Local Cache mà không cần tải lại các năm cũ.
+

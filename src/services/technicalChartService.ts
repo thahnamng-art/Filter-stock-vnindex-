@@ -1,10 +1,11 @@
 import { StockData, TimeFrame, getVietnamTodayDateStr } from '../types/screener';
+import { loadCachedSymbolOhlcv, saveCachedSymbolOhlcv } from './marketCacheStorage';
 
 export interface OhlcvCandle {
   timestamp: number;
   dateStr: string;      // YYYY-MM-DD
   shortDate: string;    // DD/MM
-  monthLabel?: string;  // "Tháng 9", "Tháng 10", etc. when month changes
+  monthLabel?: string;  // "Tháng 9", "Năm 2025", "Thg 6/25", etc. when month changes
   open: number;
   high: number;
   low: number;
@@ -37,6 +38,14 @@ export interface ComputedChartPoint extends OhlcvCandle {
   mcdxHotMoney: number;
   mcdxRetailer: number;
   mcdxBankerMa10: number;
+  // Independent Buy & Sell Signals
+  // Buy Signal: Default Filter criteria + MCDX Banker crosses above 25, 50, or 75
+  buySignalLevel: 25 | 50 | 75 | null;
+  // Whether this bar also satisfies the strict >= 100B VND value & RS52w >= 70 criteria
+  buySignalPassesStrictValue: boolean;
+  // Sell Signal (Independent): MCDX Banker drops > 25% compared to max MCDX of previous 10 sessions
+  sellSignalLevel: number | null; // Drop % from 10-session peak (e.g. 28 means -28%)
+  sellSignalPeak10: number | null; // Highest MCDX Banker in the previous 10 sessions
   // 7. VNINDEX synchronized candle
   vnindexOpen: number;
   vnindexHigh: number;
@@ -57,8 +66,52 @@ export interface FullTechnicalChartData {
   vnindexChangePct: number;
 }
 
-// Cache for live VNDirect OHLCV responses
+// Cache for live + extended multi-year VNDirect OHLCV responses per symbol
 const liveOhlcvCache = new Map<string, OhlcvCandle[]>();
+const symbolYearsLoadedCache = new Map<string, number>();
+const symbolExtendInFlight = new Map<
+  string,
+  Promise<{ candles: OhlcvCandle[]; yearsLoaded: number; addedBars: number }>
+>();
+
+export const MAX_CHART_HISTORY_YEARS = 10;
+
+export function getSymbolYearsLoaded(symbol: string): number {
+  const upper = symbol.trim().toUpperCase();
+  return symbolYearsLoadedCache.get(upper) ?? 1;
+}
+
+// Normalize, deduplicate, sort ascending, and assign multi-year aware month labels
+function normalizeAndLabelCandles(rawCandles: OhlcvCandle[]): OhlcvCandle[] {
+  if (rawCandles.length === 0) return [];
+  const byDate = new Map<string, OhlcvCandle>();
+  for (const c of rawCandles) {
+    byDate.set(c.dateStr, c);
+  }
+  const sorted = Array.from(byDate.values()).sort((a, b) => a.timestamp - b.timestamp);
+  const latestYear =
+    Number(sorted[sorted.length - 1]?.dateStr.slice(0, 4)) || new Date().getFullYear();
+
+  let prevMonthKey = '';
+  for (let i = 0; i < sorted.length; i++) {
+    const yyyy = Number(sorted[i].dateStr.slice(0, 4));
+    const mNum = Number(sorted[i].dateStr.slice(5, 7));
+    const monthKey = `${yyyy}-${mNum}`;
+    if (monthKey !== prevMonthKey) {
+      if (mNum === 1) {
+        sorted[i].monthLabel = `Năm ${yyyy}`;
+      } else if (yyyy < latestYear) {
+        sorted[i].monthLabel = `Thg ${mNum}/${String(yyyy).slice(2)}`;
+      } else {
+        sorted[i].monthLabel = `Tháng ${mNum}`;
+      }
+      prevMonthKey = monthKey;
+    } else {
+      sorted[i].monthLabel = undefined;
+    }
+  }
+  return sorted;
+}
 
 // Generate trading dates ending at current Vietnam date (e.g. 2026-11-11)
 function buildTradingDates(count: number): { timestamp: number; dateStr: string; shortDate: string; monthLabel?: string }[] {
@@ -81,12 +134,21 @@ function buildTradingDates(count: number): { timestamp: number; dateStr: string;
     d.setUTCDate(d.getUTCDate() - 1);
   }
 
-  let prevMonth = -1;
+  const latestYear = Number(todayVn.slice(0, 4)) || new Date().getFullYear();
+  let prevMonthKey = '';
   for (let i = 0; i < result.length; i++) {
+    const yyyy = Number(result[i].dateStr.slice(0, 4));
     const monthNum = Number(result[i].dateStr.slice(5, 7));
-    if (monthNum !== prevMonth) {
-      result[i].monthLabel = `Tháng ${monthNum}`;
-      prevMonth = monthNum;
+    const monthKey = `${yyyy}-${monthNum}`;
+    if (monthKey !== prevMonthKey) {
+      if (monthNum === 1) {
+        result[i].monthLabel = `Năm ${yyyy}`;
+      } else if (yyyy < latestYear) {
+        result[i].monthLabel = `Thg ${monthNum}/${String(yyyy).slice(2)}`;
+      } else {
+        result[i].monthLabel = `Tháng ${monthNum}`;
+      }
+      prevMonthKey = monthKey;
     }
   }
 
@@ -364,33 +426,28 @@ export function buildOhlcvFromStock(stock: StockData): OhlcvCandle[] {
   return candles;
 }
 
-// Fetch live OHLCV candles from VNDirect dchart API (direct or via CORS proxy for GitHub Pages)
-export async function fetchLiveOhlcvFromVNDirect(
+const VNDIRECT_SYMBOL_MAP: Record<string, string> = {
+  VNINDEX: 'VNINDEX',
+  VN30: 'VN30',
+  HNXINDEX: 'HNX',
+  UPCOMINDEX: 'UPCOM',
+  VN100: 'VN100',
+  HNX30: 'HNX30',
+  VN30F1M: 'VN30F1M'
+};
+
+// Low-level helper to fetch a specific [fromSec, toSec] window from VNDirect dchart API
+async function fetchOhlcvWindowFromVNDirect(
   symbol: string,
+  fromSec: number,
+  toSec: number,
   timeoutMs: number = 2800
 ): Promise<OhlcvCandle[] | null> {
   const upper = symbol.trim().toUpperCase();
-  if (liveOhlcvCache.has(upper)) {
-    return liveOhlcvCache.get(upper)!;
-  }
-
-  // Map index display symbols to VNDirect dchart symbol codes
-  const vndirectSymbolMap: Record<string, string> = {
-    VNINDEX: 'VNINDEX',
-    VN30: 'VN30',
-    HNXINDEX: 'HNX',
-    UPCOMINDEX: 'UPCOM',
-    VN100: 'VN100',
-    HNX30: 'HNX30',
-    VN30F1M: 'VN30F1M'
-  };
-  const apiSymbol = vndirectSymbolMap[upper] || upper;
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  const fromSec = nowSec - 86400 * 400; // ~260 trading sessions
+  const apiSymbol = VNDIRECT_SYMBOL_MAP[upper] || upper;
   const directUrl = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
     apiSymbol
-  )}&from=${fromSec}&to=${nowSec}`;
+  )}&from=${fromSec}&to=${toSec}`;
 
   const candidateUrls = [
     directUrl,
@@ -406,10 +463,9 @@ export async function fetchLiveOhlcvFromVNDirect(
       clearTimeout(timer);
       if (!res.ok) continue;
       const data = await res.json();
-      if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= 25) {
+      if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= 5) {
         const len = data.c.length;
         const candles: OhlcvCandle[] = [];
-        let prevMonth = -1;
 
         for (let i = 0; i < len; i++) {
           const ts = data.t[i];
@@ -417,18 +473,11 @@ export async function fetchLiveOhlcvFromVNDirect(
           const yyyy = dt.getFullYear();
           const mm = String(dt.getMonth() + 1).padStart(2, '0');
           const dd = String(dt.getDate()).padStart(2, '0');
-          const mNum = dt.getMonth() + 1;
-          let monthLabel: string | undefined;
-          if (mNum !== prevMonth) {
-            monthLabel = `Tháng ${mNum}`;
-            prevMonth = mNum;
-          }
 
           candles.push({
             timestamp: ts,
             dateStr: `${yyyy}-${mm}-${dd}`,
             shortDate: `${dd}/${mm}`,
-            monthLabel,
             open: Number(data.o?.[i] ?? data.c[i]),
             high: Number(data.h?.[i] ?? data.c[i]),
             low: Number(data.l?.[i] ?? data.c[i]),
@@ -437,14 +486,227 @@ export async function fetchLiveOhlcvFromVNDirect(
           });
         }
 
-        liveOhlcvCache.set(upper, candles);
-        return candles;
+        return normalizeAndLabelCandles(candles);
       }
     } catch {
       clearTimeout(timer);
     }
   }
   return null;
+}
+
+// Synthesize 1 additional prior year (~252 trading sessions) ending right before earliestCandle
+function synthesizePriorOneYearOhlcv(
+  stock: StockData,
+  earliestCandle: OhlcvCandle,
+  yearIndex: number,
+  sessionsCount: number = 252
+): OhlcvCandle[] {
+  const dates: { timestamp: number; dateStr: string; shortDate: string }[] = [];
+  const d = new Date(`${earliestCandle.dateStr}T09:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+
+  while (dates.length < sessionsCount) {
+    const day = d.getUTCDay();
+    if (day !== 0 && day !== 6) {
+      const yyyy = d.getUTCFullYear();
+      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const dd = String(d.getUTCDate()).padStart(2, '0');
+      dates.unshift({
+        timestamp: Math.floor(d.getTime() / 1000),
+        dateStr: `${yyyy}-${mm}-${dd}`,
+        shortDate: `${dd}/${mm}`
+      });
+    }
+    d.setUTCDate(d.getUTCDate() - 1);
+  }
+
+  const closes = new Array<number>(sessionsCount);
+  let curr = earliestCandle.open;
+  const minFloor = Math.max(0.5, stock.price * 0.18);
+
+  for (let i = sessionsCount - 1; i >= 0; i--) {
+    const n = seededNoise(`${stock.symbol}_Y${yearIndex}`, i);
+    const pctStep = (n - 0.486) * 0.028;
+    curr = Math.max(minFloor, Math.round((curr / (1 + pctStep)) * 100) / 100);
+    closes[i] = curr;
+  }
+
+  const baseVol = earliestCandle.volume || stock.total_volume || 250000;
+  const out: OhlcvCandle[] = new Array(sessionsCount);
+
+  for (let i = 0; i < sessionsCount; i++) {
+    const close = closes[i];
+    const prevClose = i > 0 ? closes[i - 1] : close * 0.99;
+    const n1 = seededNoise(`${stock.symbol}_Y${yearIndex}_O`, i);
+    const n2 = seededNoise(`${stock.symbol}_Y${yearIndex}_H`, i);
+    const n3 = seededNoise(`${stock.symbol}_Y${yearIndex}_L`, i);
+    const nv = seededNoise(`${stock.symbol}_Y${yearIndex}_V`, i);
+
+    const open = Math.max(minFloor, Math.round(prevClose * (1 + (n1 - 0.5) * 0.012) * 100) / 100);
+    const bodyMax = Math.max(open, close);
+    const bodyMin = Math.min(open, close);
+    const bodySize = Math.max(close * 0.005, bodyMax - bodyMin);
+
+    const high = Math.round((bodyMax + bodySize * (0.25 + n2 * 1.1)) * 100) / 100;
+    const low = Math.max(minFloor, Math.round((bodyMin - bodySize * (0.25 + n3 * 1.1)) * 100) / 100);
+    const volume = Math.max(1000, Math.round(baseVol * (0.55 + nv * 0.9)));
+
+    out[i] = {
+      timestamp: dates[i].timestamp,
+      dateStr: dates[i].dateStr,
+      shortDate: dates[i].shortDate,
+      open,
+      high,
+      low,
+      close,
+      volume
+    };
+  }
+
+  return out;
+}
+
+// Fetch live OHLCV candles from local IndexedDB cache (including any previously extended years) or VNDirect 1-year default
+export async function fetchLiveOhlcvFromVNDirect(
+  symbol: string,
+  timeoutMs: number = 2800,
+  fallbackStock?: StockData
+): Promise<OhlcvCandle[] | null> {
+  const upper = symbol.trim().toUpperCase();
+  if (liveOhlcvCache.has(upper)) {
+    return liveOhlcvCache.get(upper)!;
+  }
+
+  // 1. Check browser IndexedDB for previously cached symbol history (1 year or multi-year)
+  const cachedRecord = await loadCachedSymbolOhlcv(upper);
+  if (cachedRecord && cachedRecord.candles.length >= 25) {
+    const normalizedCached = normalizeAndLabelCandles(cachedRecord.candles);
+    const estYears = Math.max(
+      1,
+      cachedRecord.yearsLoaded || Math.round(normalizedCached.length / 250)
+    );
+    liveOhlcvCache.set(upper, normalizedCached);
+    symbolYearsLoadedCache.set(upper, estYears);
+
+    // Refresh only the recent tail in background if the latest cached bar is older than today
+    const todayVn = getVietnamTodayDateStr();
+    const lastCachedDate = normalizedCached[normalizedCached.length - 1]?.dateStr;
+    if (lastCachedDate && lastCachedDate < todayVn) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const fromRecentSec = nowSec - 86400 * 45;
+      void fetchOhlcvWindowFromVNDirect(upper, fromRecentSec, nowSec, 2400).then((recent) => {
+        if (recent && recent.length > 0) {
+          const currentInMem = liveOhlcvCache.get(upper) || normalizedCached;
+          const merged = normalizeAndLabelCandles([...currentInMem, ...recent]);
+          const yrs = symbolYearsLoadedCache.get(upper) || estYears;
+          liveOhlcvCache.set(upper, merged);
+          void saveCachedSymbolOhlcv(upper, merged, yrs);
+        }
+      });
+    }
+
+    return normalizedCached;
+  }
+
+  // 2. Otherwise fetch normal 1-year window (~400 calendar days = ~260 trading sessions)
+  const nowSec = Math.floor(Date.now() / 1000);
+  const fromSec = nowSec - 86400 * 400;
+  const freshCandles = await fetchOhlcvWindowFromVNDirect(upper, fromSec, nowSec, timeoutMs);
+
+  if (freshCandles && freshCandles.length >= 25) {
+    liveOhlcvCache.set(upper, freshCandles);
+    symbolYearsLoadedCache.set(upper, 1);
+    void saveCachedSymbolOhlcv(upper, freshCandles, 1);
+    return freshCandles;
+  }
+
+  // 3. Fallback to deterministic 1-year local history if network/CORS is offline
+  if (fallbackStock) {
+    const fallbackCandles = normalizeAndLabelCandles(buildOhlcvFromStock(fallbackStock));
+    liveOhlcvCache.set(upper, fallbackCandles);
+    symbolYearsLoadedCache.set(upper, 1);
+    void saveCachedSymbolOhlcv(upper, fallbackCandles, 1);
+    return fallbackCandles;
+  }
+
+  return null;
+}
+
+/**
+ * On-demand +1 Year historical extension for ONLY the currently viewed symbol when panning left into history.
+ * Persists the expanded multi-year series to browser IndexedDB so future visits reuse it without re-fetching.
+ */
+export async function extendSymbolHistoryByOneYear(
+  stock: StockData,
+  timeoutMs: number = 2800
+): Promise<{ candles: OhlcvCandle[]; yearsLoaded: number; addedBars: number }> {
+  const upper = stock.symbol.trim().toUpperCase();
+
+  if (symbolExtendInFlight.has(upper)) {
+    return symbolExtendInFlight.get(upper)!;
+  }
+
+  const task = (async () => {
+    let existing = liveOhlcvCache.get(upper);
+    if (!existing || existing.length === 0) {
+      const fromDb = await loadCachedSymbolOhlcv(upper);
+      if (fromDb && fromDb.candles.length >= 25) {
+        existing = normalizeAndLabelCandles(fromDb.candles);
+        symbolYearsLoadedCache.set(upper, fromDb.yearsLoaded || Math.max(1, Math.round(existing.length / 250)));
+      } else {
+        existing = normalizeAndLabelCandles(buildOhlcvFromStock(stock));
+        symbolYearsLoadedCache.set(upper, 1);
+      }
+    }
+
+    const currentYears =
+      symbolYearsLoadedCache.get(upper) || Math.max(1, Math.round(existing.length / 250));
+    if (currentYears >= MAX_CHART_HISTORY_YEARS) {
+      return { candles: existing, yearsLoaded: currentYears, addedBars: 0 };
+    }
+
+    const earliestCandle = existing[0];
+    const earliestTs = earliestCandle.timestamp;
+    const toSec = earliestTs - 86400;
+    const fromSec = earliestTs - 86400 * 372; // ~1 calendar year prior
+
+    let olderCandles = await fetchOhlcvWindowFromVNDirect(upper, fromSec, toSec, timeoutMs);
+    if (olderCandles) {
+      olderCandles = olderCandles.filter((c) => c.dateStr < earliestCandle.dateStr);
+    }
+
+    // If VNDirect didn't return older bars for that year (or offline/index), synthesize 1 prior year smoothly
+    if (!olderCandles || olderCandles.length < 15) {
+      olderCandles = synthesizePriorOneYearOhlcv(
+        stock,
+        earliestCandle,
+        currentYears + 1,
+        252
+      );
+    }
+
+    const merged = normalizeAndLabelCandles([...olderCandles, ...existing]);
+    const addedBars = merged.length - existing.length;
+    const nextYears = currentYears + 1;
+
+    liveOhlcvCache.set(upper, merged);
+    symbolYearsLoadedCache.set(upper, nextYears);
+    await saveCachedSymbolOhlcv(upper, merged, nextYears);
+
+    return {
+      candles: merged,
+      yearsLoaded: nextYears,
+      addedBars
+    };
+  })();
+
+  symbolExtendInFlight.set(upper, task);
+  try {
+    return await task;
+  } finally {
+    symbolExtendInFlight.delete(upper);
+  }
 }
 
 // Aggregate Daily candles into Weekly candles when timeframe === '1W'
@@ -548,27 +810,28 @@ function calcRsiSeries(closes: number[], period: number): number[] {
   return rsi;
 }
 
-// Build synthetic or live VNINDEX series aligned with the stock's dates
+// Build synthetic or live VNINDEX series aligned with the stock's dates (seeded from newest bar backward so prepending older years keeps recent bars identical)
 function buildAlignedVnindexCandles(baseCandles: OhlcvCandle[]): OhlcvCandle[] {
   const len = baseCandles.length;
   const out: OhlcvCandle[] = new Array(len);
-  // Anchor final VNINDEX around 1,740.10 as shown in screenshot
   const closes: number[] = new Array(len);
   let curr = 1740.1;
   closes[len - 1] = curr;
 
   for (let i = len - 2; i >= 0; i--) {
-    const n = seededNoise('VNINDEX', i);
+    const offsetFromEnd = len - 1 - i;
+    const n = seededNoise('VNINDEX', offsetFromEnd);
     const step = (n - 0.485) * 14.5;
-    curr = Math.max(1150, Math.round((curr - step) * 100) / 100);
+    curr = Math.max(680, Math.round((curr - step) * 100) / 100);
     closes[i] = curr;
   }
 
   for (let i = 0; i < len; i++) {
+    const offsetFromEnd = len - 1 - i;
     const c = closes[i];
     const prev = i > 0 ? closes[i - 1] : c - 2.5;
-    const n1 = seededNoise('VNINDEX_O', i);
-    const n2 = seededNoise('VNINDEX_H', i);
+    const n1 = seededNoise('VNINDEX_O', offsetFromEnd);
+    const n2 = seededNoise('VNINDEX_H', offsetFromEnd);
     const open = Math.round((prev + (n1 - 0.5) * 4.2) * 100) / 100;
     const high = Math.round((Math.max(open, c) + 2.5 + n2 * 6.5) * 100) / 100;
     const low = Math.round((Math.min(open, c) - 2.2 - (1 - n2) * 6.0) * 100) / 100;
@@ -668,8 +931,99 @@ export function computeFullTechnicalChart(
   // 7. VNINDEX aligned series
   const vnCandles = buildAlignedVnindexCandles(candles);
 
+  const isMarketIndex = MARKET_INDEX_STOCKS.some((m) => m.symbol === stock.symbol);
+  const stockRs52 = stock.rs_52w ?? 75;
+
   const points: ComputedChartPoint[] = new Array(len);
   for (let i = 0; i < len; i++) {
+    const currClose = closes[i];
+    const prevClose = i > 0 ? closes[i - 1] : currClose;
+    const ret1d = prevClose > 0 ? ((currClose - prevClose) / prevClose) * 100 : 0;
+
+    const currMa50 = ma50[i];
+    const currMa200 = ma200[i];
+    const currRsi14 = rsi14[i];
+    const currVol = volumes[i];
+    const currVolSma10 = volSma10[i] ?? currVol;
+
+    const currBanker = bankerArr[i];
+    const prevBanker = i > 0 ? bankerArr[i - 1] : currBanker;
+    // Minimum and maximum banker in recent 3 prior bars (matching default rule cross_lookback = 3)
+    let minPrev3Banker = prevBanker;
+    for (let k = Math.max(0, i - 3); k < i; k++) {
+      if (bankerArr[k] < minPrev3Banker) minPrev3Banker = bankerArr[k];
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. INDEPENDENT BUY SIGNAL:
+    //    Default Filter technical rules + MCDX Banker crosses above 25, 50, or 75
+    // -------------------------------------------------------------------------
+    const passesDefaultTechFilter =
+      i > 0 &&
+      currMa50 !== null &&
+      currClose > currMa50 &&
+      currMa200 !== null &&
+      currClose > currMa200 &&
+      currRsi14 >= 44.26 &&
+      currVol >= currVolSma10 &&
+      ret1d >= -30.0 &&
+      ret1d <= 50.0 &&
+      currBanker > prevBanker;
+
+    let buySignalLevel: 25 | 50 | 75 | null = null;
+    if (passesDefaultTechFilter) {
+      // Check crossing above 75, 50, or 25 (when previous bar was below threshold or 3-bar lookback crossed up)
+      if (currBanker >= 75 && prevBanker < 75 && minPrev3Banker < 75) {
+        buySignalLevel = 75;
+      } else if (currBanker >= 50 && prevBanker < 50 && minPrev3Banker < 50) {
+        buySignalLevel = 50;
+      } else if (currBanker >= 25 && prevBanker < 25 && minPrev3Banker < 25) {
+        buySignalLevel = 25;
+      }
+    }
+
+    const barValueBillion = (currVol * currClose * 1000) / 1e9;
+    const buySignalPassesStrictValue =
+      isMarketIndex ||
+      ((barValueBillion >= 100 || stock.total_value >= 100) && stockRs52 >= 70);
+
+    // -------------------------------------------------------------------------
+    // 2. INDEPENDENT SELL SIGNAL:
+    //    Triggers when current MCDX Banker drops > 25% compared to the highest
+    //    MCDX Banker in the previous 10 sessions (currBanker < maxPrev10Banker * 0.75)
+    // -------------------------------------------------------------------------
+    let maxPrev10Banker = 0;
+    const start10 = Math.max(0, i - 10);
+    for (let k = start10; k < i; k++) {
+      if (bankerArr[k] > maxPrev10Banker) {
+        maxPrev10Banker = bankerArr[k];
+      }
+    }
+
+    let prevMax10Banker = 0;
+    if (i > 1) {
+      const prevStart10 = Math.max(0, i - 11);
+      for (let k = prevStart10; k < i - 1; k++) {
+        if (bankerArr[k] > prevMax10Banker) {
+          prevMax10Banker = bankerArr[k];
+        }
+      }
+    }
+
+    let sellSignalLevel: number | null = null;
+    const sellSignalPeak10 = i > 0 ? Math.round(maxPrev10Banker * 10) / 10 : null;
+    if (
+      i > 0 &&
+      maxPrev10Banker >= 5 &&
+      currBanker < maxPrev10Banker * 0.75 &&
+      (i === 1 || prevBanker >= prevMax10Banker * 0.75)
+    ) {
+      sellSignalLevel = Math.max(
+        25,
+        Math.round(((maxPrev10Banker - currBanker) / maxPrev10Banker) * 100)
+      );
+    }
+
     points[i] = {
       ...candles[i],
       macd: Math.round(macdLine[i] * 100) / 100,
@@ -681,15 +1035,19 @@ export function computeFullTechnicalChart(
       bbUpper: bbUpper[i],
       bbMiddle: bbMiddle[i],
       bbLower: bbLower[i],
-      volSma10: Math.round(volSma10[i] ?? volumes[i]),
-      rsi14: Math.round(rsi14[i] * 100) / 100,
+      volSma10: Math.round(currVolSma10),
+      rsi14: Math.round(currRsi14 * 100) / 100,
       rsiSignal: Math.round(rsiSignal[i] * 100) / 100,
       stochK: Math.round(stochKSeries[i] * 100) / 100,
       stochD: Math.round(stochDSeries[i] * 100) / 100,
-      mcdxBanker: bankerArr[i],
+      mcdxBanker: currBanker,
       mcdxHotMoney: hotArr[i],
       mcdxRetailer: retailerArr[i],
       mcdxBankerMa10: Math.round(bankerMa10[i] * 10000) / 10000,
+      buySignalLevel,
+      buySignalPassesStrictValue,
+      sellSignalLevel,
+      sellSignalPeak10,
       vnindexOpen: vnCandles[i].open,
       vnindexHigh: vnCandles[i].high,
       vnindexLow: vnCandles[i].low,
