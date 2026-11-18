@@ -25,14 +25,15 @@ import {
 import {
   initializeVietnamStockUniverse,
   syncRealMarketDataFromVNDirect,
+  syncIntradayT0FastOnFilter,
   getExchangeBreakdown,
   SyncScopeMode,
   SyncBatchProgress
 } from './data/mockVietnamStocks';
 import { evaluateScreener } from './services/screenerEngine';
 import {
-  loadCachedMarketUniverse,
-  saveCachedMarketUniverse,
+  hydrateDeltaCacheToRAM,
+  buildStocksFromRamDeltaCache,
   clearCachedMarketUniverse,
   getQuickCacheMeta
 } from './services/marketCacheStorage';
@@ -202,14 +203,14 @@ export default function App() {
   const [chartSymbol, setChartSymbol] = useState<string>('VNINDEX');
   const [viewMode, setViewMode] = useState<'MOBILE' | 'DESKTOP'>('MOBILE');
 
-  // Session & Sync states (100% real VNDirect data + IndexedDB cache, no 5s random tick simulator)
+  // Session & Sync states (Delta Caching: T-1 IndexedDB per symbol + 1-Request T0 Snapshot size=2000)
   const [sessionMinutes] = useState(165); // 165 phút trong phiên
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
   // Sync Inspector Modal & Batch Controls
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
-  const [syncMode, setSyncMode] = useState<SyncScopeMode>('FULL_1626');
+  const [syncMode, setSyncMode] = useState<SyncScopeMode>('DELTA_ADJUSTED');
   const [syncExchanges, setSyncExchanges] = useState<ExchangeType[]>(['HOSE', 'HNX', 'UPCOM']);
   const [batchProgress, setBatchProgress] = useState<SyncBatchProgress | null>(null);
   const [lastSyncDate, setLastSyncDate] = useState<string>(() => {
@@ -222,6 +223,7 @@ export default function App() {
   });
   const [isRestoredFromCache, setIsRestoredFromCache] = useState<boolean>(false);
   const abortSyncRef = useRef<boolean>(false);
+  const isFastT0SyncingRef = useRef<boolean>(false);
 
   const handleToggleSyncExchange = (ex: ExchangeType) => {
     setSyncExchanges((prev) => {
@@ -232,7 +234,30 @@ export default function App() {
     });
   };
 
-  // Progressive real data sync from VNDirect across all 1,626 stocks + automatic IndexedDB persistence
+  // Tối ưu tải dữ liệu trong ngày (Intraday T0):
+  // Mỗi lần user bấm Filter, chỉ gọi 1 API duy nhất lấy bảng giá snapshot T0 (size=2000)
+  // và ghép cây nến T0 vào cuối mảng lịch sử T-1 đang có trên RAM rồi mới chạy lọc.
+  const triggerIntradayT0FilterSync = async () => {
+    if (isSyncing || isFastT0SyncingRef.current) return;
+    isFastT0SyncingRef.current = true;
+    try {
+      const res = await syncIntradayT0FastOnFilter(stocks);
+      if (res.t0Count > 0) {
+        setStocks(res.stocks);
+        setLastSyncDate(res.t0Date);
+        const quickMeta = getQuickCacheMeta();
+        if (quickMeta?.updatedAt) {
+          setCacheUpdatedAt(quickMeta.updatedAt);
+        }
+      }
+    } catch {
+      // Giữ nguyên dữ liệu trên RAM nếu mạng gián đoạn
+    } finally {
+      isFastT0SyncingRef.current = false;
+    }
+  };
+
+  // Luồng đồng bộ Delta Caching (1 API T0 size=2000 + đối chiếu basicPrice > 0.05 làm mới theo batch 15-20 mã)
   const runBatchSyncWithBase = async (baseStocks: StockData[], customMode?: SyncScopeMode) => {
     abortSyncRef.current = false;
     setIsSyncing(true);
@@ -242,45 +267,35 @@ export default function App() {
       const res = await syncRealMarketDataFromVNDirect(baseStocks, {
         mode: activeMode,
         targetExchanges: syncExchanges,
-        batchSize: 45,
-        timeoutMs: 3200,
+        batchSize: 18, // 18 mã/request (trong khoảng 15-20 mã/request với toán tử code:MÃ1,MÃ2...)
+        timeoutMs: 4200,
         shouldAbort: () => abortSyncRef.current,
         onBatchProgress: (prog) => {
           setBatchProgress(prog);
           const pct = Math.round((prog.processed / Math.max(1, prog.totalTarget)) * 100);
           setSyncStatusMsg(
-            `Đang đồng bộ cuốn chiếu Lô ${prog.batchIndex}/${prog.totalBatches}: ${prog.processed.toLocaleString()}/${prog.totalTarget.toLocaleString()} mã (${pct}%) — HTTP Live: ${prog.liveUpdatedCount} · Tự động lưu IndexedDB`
+            `Delta Sync Lô ${prog.batchIndex}/${prog.totalBatches} (18 mã/req): ${prog.processed.toLocaleString()}/${prog.totalTarget.toLocaleString()} (${pct}%) — Cache Hit T-1: ${prog.cacheHitCount || 0} · Làm mới điều chỉnh giá: ${prog.refreshedAdjustedCount || 0}`
           );
         },
         onIncrementalStocksUpdate: (stocksSnapshot, meta) => {
           setStocks(stocksSnapshot);
           setLastSyncDate(meta.lastDate);
-          saveCachedMarketUniverse({
-            stocks: stocksSnapshot,
-            lastSyncDate: meta.lastDate,
-            liveHttpCount: meta.liveHttpCount
-          }).then((savedMeta) => {
-            if (savedMeta) {
-              setCacheUpdatedAt(savedMeta.updatedAt);
-            }
-          });
+          const quickMeta = getQuickCacheMeta();
+          if (quickMeta?.updatedAt) {
+            setCacheUpdatedAt(quickMeta.updatedAt);
+          }
         }
       });
 
       setStocks(res.stocks);
       setLastSyncDate(res.lastDate);
-
-      const savedMeta = await saveCachedMarketUniverse({
-        stocks: res.stocks,
-        lastSyncDate: res.lastDate,
-        liveHttpCount: res.liveHttpCount
-      });
-      if (savedMeta) {
-        setCacheUpdatedAt(savedMeta.updatedAt);
+      const quickMeta = getQuickCacheMeta();
+      if (quickMeta?.updatedAt) {
+        setCacheUpdatedAt(quickMeta.updatedAt);
       }
 
       setSyncStatusMsg(
-        `Đã đồng bộ & lưu IndexedDB ${res.successCount.toLocaleString()} mã CP (HOSE: ${res.breakdown.HOSE} · HNX: ${res.breakdown.HNX} · UPCoM: ${res.breakdown.UPCOM} · HTTP Live: ${res.liveHttpCount} — Phiên ${formatVnDateDisplay(res.lastDate)})`
+        `Delta Sync hoàn tất: Snapshot T0 (${res.t0SnapshotCount.toLocaleString()} mã, 1 API) · Tái sử dụng Cache T-1: ${res.cacheHitCount.toLocaleString()} mã · Làm mới điều chỉnh giá: ${res.invalidatedRefreshedCount.toLocaleString()} mã (Phiên ${formatVnDateDisplay(res.lastDate)})`
       );
       setTimeout(() => setSyncStatusMsg(null), 7000);
     } catch (err: any) {
@@ -293,7 +308,7 @@ export default function App() {
 
   const handleStartBatchSync = () => {
     setSyncStatusMsg(
-      `Đang kết nối VNDirect đồng bộ cuốn chiếu ${stocks.length.toLocaleString()} mã CP (HOSE, HNX, UPCoM)...`
+      `Đang chạy Delta Sync VNDirect (1 API Snapshot T0 size=2000 + kiểm định basicPrice > 0.05)...`
     );
     runBatchSyncWithBase(stocks);
   };
@@ -305,8 +320,8 @@ export default function App() {
     setStocks(freshEmbedded);
     setCacheUpdatedAt(null);
     setIsRestoredFromCache(false);
-    setSyncStatusMsg('Đã xóa Cache IndexedDB — Đang đồng bộ lại toàn bộ 1,626 mã từ VNDirect...');
-    runBatchSyncWithBase(freshEmbedded, 'FULL_1626');
+    setSyncStatusMsg('Đã xóa Cache IndexedDB — Đang nạp lại lịch sử đã điều chỉnh (18 mã/request) từ VNDirect...');
+    runBatchSyncWithBase(freshEmbedded, 'DELTA_ADJUSTED');
   };
 
   const handleAbortSync = () => {
@@ -326,37 +341,31 @@ export default function App() {
   const [isPythonModalOpen, setIsPythonModalOpen] = useState(false);
   const [isGithubModalOpen, setIsGithubModalOpen] = useState(false);
 
-  // On mount: 1) Immediately restore latest market data from IndexedDB (previous session), 2) Start progressive sync
+  // Khi mở app: 1) Nạp toàn bộ cache từng mã từ IndexedDB lên RAM để dùng ngay, 2) Chạy Delta Sync (1 request T0 + kiểm tra basicPrice)
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const cached = await loadCachedMarketUniverse();
+      const { hydratedFromIdbCount } = await hydrateDeltaCacheToRAM(stocks);
       if (!mounted) return;
 
-      if (cached && Array.isArray(cached.stocks) && cached.stocks.length > 0) {
-        setStocks(cached.stocks);
-        setLastSyncDate(cached.lastSyncDate);
-        setCacheUpdatedAt(cached.updatedAt);
+      const ramStocks = buildStocksFromRamDeltaCache(stocks);
+      setStocks(ramStocks);
+
+      const quickMeta = getQuickCacheMeta();
+      if (hydratedFromIdbCount > 0) {
         setIsRestoredFromCache(true);
+        if (quickMeta?.lastSyncDate) setLastSyncDate(quickMeta.lastSyncDate);
+        if (quickMeta?.updatedAt) setCacheUpdatedAt(quickMeta.updatedAt);
         setSyncStatusMsg(
-          `Đã nạp ngay dữ liệu từ lần mở trước (${cached.updatedAt}) — Đang đồng bộ cuốn chiếu dữ liệu mới nhất...`
+          `Đã nạp ${hydratedFromIdbCount.toLocaleString()} mã từ IndexedDB lên RAM — Đang lấy Snapshot T0 (1 API size=2000) & đối chiếu giá tham chiếu...`
         );
-        runBatchSyncWithBase(cached.stocks, 'FULL_1626');
       } else {
-        // First time ever opening the app: save initial snapshot into IndexedDB and start progressive sync
-        const initialMeta = await saveCachedMarketUniverse({
-          stocks,
-          lastSyncDate: getVietnamTodayDateStr(),
-          liveHttpCount: 0
-        });
-        if (mounted && initialMeta) {
-          setCacheUpdatedAt(initialMeta.updatedAt);
-        }
         setSyncStatusMsg(
-          `Đang kết nối VNDirect đồng bộ cuốn chiếu ${stocks.length.toLocaleString()} mã CP...`
+          `Khởi tạo Delta Cache lần đầu — Đang lấy Snapshot T0 (size=2000) & đồng bộ lịch sử điều chỉnh từ VNDirect...`
         );
-        runBatchSyncWithBase(stocks, 'FULL_1626');
       }
+
+      runBatchSyncWithBase(ramStocks, 'DELTA_ADJUSTED');
     })();
 
     return () => {
@@ -422,11 +431,12 @@ export default function App() {
     setDesktopRightTab('CHART');
   };
 
-  // Rule operations
+  // Rule operations (tự động ghép nến T0 từ 1 API size=2000 trên nền Cache T-1 RAM)
   const handleToggleRule = (id: string) => {
     setRules((prev) =>
       prev.map((r) => (r.id === id ? { ...r, enabled: !r.enabled } : r))
     );
+    triggerIntradayT0FilterSync();
   };
 
   const handleDeleteRule = (id: string) => {
@@ -456,20 +466,24 @@ export default function App() {
 
   const handleSaveEditedRule = (updated: AnyFilterRule) => {
     setRules((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+    triggerIntradayT0FilterSync();
   };
 
   const handleAddNewRule = (newRule: AnyFilterRule) => {
     setRules((prev) => [...prev, newRule]);
+    triggerIntradayT0FilterSync();
   };
 
   const handleResetToDefault = () => {
     setRules(INITIAL_RULES);
     setActivePresetId('preset_banker_breakout');
+    triggerIntradayT0FilterSync();
   };
 
   const handleApplyPreset = (preset: ScreenerPreset) => {
     setRules(JSON.parse(JSON.stringify(preset.rules)));
     setActivePresetId(preset.id);
+    triggerIntradayT0FilterSync();
   };
 
   const activeRulesCount = rules.filter((r) => r.enabled).length;
@@ -760,7 +774,10 @@ export default function App() {
               </button>
 
               <button
-                onClick={() => setActiveTab('RESULTS')}
+                onClick={() => {
+                  setActiveTab('RESULTS');
+                  triggerIntradayT0FilterSync();
+                }}
                 className={`flex flex-col items-center justify-center gap-1 relative transition-colors ${
                   activeTab === 'RESULTS' ? 'text-purple-400 font-bold' : 'text-slate-400 hover:text-slate-200'
                 }`}
@@ -874,7 +891,10 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setDesktopRightTab('RESULTS')}
+                    onClick={() => {
+                      setDesktopRightTab('RESULTS');
+                      triggerIntradayT0FilterSync();
+                    }}
                     className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
                       desktopRightTab === 'RESULTS'
                         ? 'bg-purple-600 text-white shadow-sm'

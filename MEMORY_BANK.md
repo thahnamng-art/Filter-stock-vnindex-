@@ -125,6 +125,15 @@
     2. Trích xuất khóa riêng chuẩn **PKCS#8 DER (`android-keystore/fialda-signing.pk8`)** và chứng chỉ **X.509 PEM (`android-keystore/fialda-signing.x509.pem`)** (SHA-256: `84:AB:AC:FF:E3:73:84:16:D3:58:9E:A9:81:0C:55:08:36:29:0F:1D:D3:71:AB:62:A7:66:02:51:50:84:F9:BF`).
     3. Sau khi Gradle đóng gói xong APK, dùng **`apksigner sign --key android-keystore/fialda-signing.pk8 --cert android-keystore/fialda-signing.x509.pem`** để ký trực tiếp mà không đi qua `java.security.KeyStore`, đảm bảo workflow chạy xanh 100% và mọi bản Release APK mới luôn giữ cố định duy nhất một chữ ký số.
 
-
-
-
+### [2026-11-18] Tái Cấu Trúc Tầng Storage & Data Loader Theo Kiến Trúc Delta Caching (VNDirect finfo-api + IndexedDB Per-Symbol)
+- **1. Lưu trữ IndexedDB theo từng mã cổ phiếu (`stock_delta_cache_v2` trong `src/services/marketCacheStorage.ts`):**
+  - Chuyển từ lưu nguyên khối sang lưu riêng từng bản ghi lịch sử đã chốt (từ `T-1` trở về trước, ~200–250 phiên) theo cấu trúc `{ symbol, exchange, lastSyncDate, lastClose, lastAvgPrice, candles: [...] }` với `keyPath: 'symbol'`.
+  - Khi mở ứng dụng hoặc bấm Filter, toàn bộ cache được nạp một lần từ IndexedDB lên bộ nhớ đệm RAM (`ramDeltaCacheMap`) bằng `store.getAll()` để tái sử dụng tức thì, tuyệt đối không gọi lại API lịch sử nếu không cần thiết.
+- **2. Tối ưu tải dữ liệu trong ngày (`Intraday T0` — 1 API Call duy nhất trong `src/data/mockVietnamStocks.ts` & `src/App.tsx`):**
+  - Mỗi khi người dùng bấm Filter / chọn Preset / bật tắt điều kiện lọc trong ngày (`syncIntradayT0FastOnFilter`), hệ thống chỉ gọi **1 API duy nhất** lấy bảng giá snapshot ngày hôm nay (`T0`) của toàn thị trường (`size=2000`) từ `https://finfo-api.vndirect.com.vn/v4/stock_prices`.
+  - Ghép (`append/update`) cây nến `T0` trực tiếp vào cuối mảng dữ liệu lịch sử `T-1` đang có sẵn trên RAM (`buildStocksFromRamDeltaCache`) rồi mới chạy bộ máy tính toán chỉ báo và lọc cổ phiếu.
+- **3. Tự động phát hiện và làm mới mã điều chỉnh giá (`Cache Invalidation` theo `basicPrice`):**
+  - Ở lần đồng bộ đầu tiên trong ngày, đối chiếu `T0.basicPrice` (giá tham chiếu hôm nay) với dữ liệu `T-1` trong cache:
+    - Với sàn **`HOSE` và `HNX`**: so sánh `|T0.basicPrice - cache.lastClose| > 0.05`.
+    - Với sàn **`UPCOM`**: so sánh `|T0.basicPrice - cache.lastAvgPrice| > 0.05`.
+  - Nếu chênh lệch `> 0.05` (do chia cổ tức, thưởng cổ phiếu, chia tách hoặc mã chưa có trong cache), đánh dấu mã cần làm mới và gom thành từng batch **18 mã/request (15–20 mã/request)** dùng toán tử `code:MÃ1,MÃ2...` của VNDirect `finfo-api` để tải lại full lịch sử đã điều chỉnh (`adClose`, `adAverage`), ghi đè vào RAM + IndexedDB và ghép lại nến `T0`.
