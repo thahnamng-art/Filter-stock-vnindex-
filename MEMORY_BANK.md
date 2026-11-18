@@ -116,4 +116,7 @@
   - **Đồng bộ thị trường mặc định giữ nguyên:** Toàn bộ luồng tải dữ liệu thị trường chung và lần mở đầu tiên của các mã vẫn chỉ tải **1 năm (~260 phiên)** để đảm bảo tốc độ tối đa.
   - **Kéo biểu đồ tự động tải thêm `+1 năm` cho riêng mã đang xem:** Khi người dùng kéo/cuộn biểu đồ về phía quá khứ chạm gần biên trái (`visibleStartIdx <= 18`) hoặc bấm nút lùi/`+1 Năm`, hệ thống chỉ gọi tải nối tiếp thêm **1 năm quá khứ trước đó** (`extendSymbolHistoryByOneYear`, tối đa 10 năm / ~2.600 phiên) cho đúng mã cổ phiếu đang mở mà không làm nhảy vị trí khung nhìn hiện tại.
   - **Lưu cố định vào IndexedDB trình duyệt (`symbol_ohlcv_v1_<SYMBOL>`):** Toàn bộ dữ liệu nhiều năm của mã đó được lưu trực tiếp vào IndexedDB trình duyệt. Những lần mở lại sau (kể cả khi tắt/mở lại trình duyệt), hệ thống tái sử dụng ngay lập tức toàn bộ số năm đã lưu từ Local Cache mà không cần tải lại các năm cũ.
+- **4. Cửa sổ `GitHub & APK` trỏ trực tiếp tới Repository Công khai & Link Tải APK (`src/components/GithubPublishModal.tsx`):**
+  - Khi người dùng bấm nút **GitHub & APK** trên thanh công cụ trên cùng, cửa sổ hiển thị trực tiếp thông tin kho lưu trữ công khai **`https://github.com/thahnamng-art/Filter-stock-vnindex-`**, tự động truy vấn GitHub Releases API để lấy phiên bản phát hành mới nhất (ví dụ `v1.0.12`), dung lượng file và cung cấp các nút bấm trực tiếp: **Tải Ngay APK Bản Mới Nhất**, **Xem trang Releases**, **Mở GitHub Repo**, **Tải Mã Nguồn (.ZIP)** và **Bản Web GitHub Pages**.
+
 
