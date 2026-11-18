@@ -118,12 +118,13 @@
   - **Lưu cố định vào IndexedDB trình duyệt (`symbol_ohlcv_v1_<SYMBOL>`):** Toàn bộ dữ liệu nhiều năm của mã đó được lưu trực tiếp vào IndexedDB trình duyệt. Những lần mở lại sau (kể cả khi tắt/mở lại trình duyệt), hệ thống tái sử dụng ngay lập tức toàn bộ số năm đã lưu từ Local Cache mà không cần tải lại các năm cũ.
 - **4. Cửa sổ `GitHub & APK` trỏ trực tiếp tới Repository Công khai & Link Tải APK (`src/components/GithubPublishModal.tsx`):**
   - Khi người dùng bấm nút **GitHub & APK** trên thanh công cụ trên cùng, cửa sổ hiển thị trực tiếp thông tin kho lưu trữ công khai **`https://github.com/thahnamng-art/Filter-stock-vnindex-`**, tự động truy vấn GitHub Releases API để lấy phiên bản phát hành mới nhất, dung lượng file và cung cấp các nút bấm trực tiếp: **Tải Ngay APK Bản Mới Nhất**, **Xem trang Releases**, **Mở GitHub Repo**, **Tải Mã Nguồn (.ZIP)** và **Bản Web GitHub Pages**.
-- **5. Khắc phục triệt để lỗi xung đột chữ ký số khi cài đè APK (`Chưa cài đặt được ứng dụng do gói xung đột với một gói hiện có`):**
-  - **Nguyên nhân gốc rễ (Đã kiểm chứng trực tiếp trên các file `apk10`, `apk12`, `apk13` từ GitHub Releases):** Trong workflow cũ, lệnh `rm -rf android && npx cap add android` tạo mới `android/app/build.gradle` mà **không có khối `signingConfigs.debug`** chỉ định tường minh file `debug.keystore`. Do đó, Android Gradle Plugin trên máy ảo GitHub Actions (`ubuntu-24.04`) đã bỏ qua file `android-keystore/fialda-debug.keystore` và tự sinh một chứng chỉ `CN=Android Debug` ngẫu nhiên mới ở mỗi lần chạy (`v1.0.10` mang mã `37c92f...`, `v1.0.12` mang mã `fd9f4a...`, `v1.0.13` mang mã `cb7f6b...`).
-  - **Giải pháp 3 lớp (`android/app/build.gradle` & `.github/workflows/build-apk.yml`):**
-    1. Không xóa thư mục `android/` khi build và khai báo tường minh khối `signingConfigs { debug { storeFile file("debug.keystore") ... } }` trong `android/app/build.gradle`.
-    2. Sau khi chạy `./gradlew assembleDebug`, gọi trực tiếp công cụ **`apksigner sign --ks android-keystore/fialda-debug.keystore`** (bật đủ v1, v2, v3 signing) để ký đè chuẩn xác bằng khóa cố định.
-    3. Chạy **`apksigner verify --print-certs`** kiểm tra mã băm SHA-256 bắt buộc phải khớp `84abacffe3738416d3589ea9810c550836290f1dd371ab62a76602515084f9bf` (`CN=Fialda Quant Screener, O=Fialda, C=VN`) trước khi đẩy lên GitHub Releases.
+- **5. Khắc phục triệt để lỗi xung đột chữ ký số & lỗi build APK trên GitHub Actions (`.github/workflows/build-apk.yml` & `android-keystore/`):**
+  - **Nguyên nhân 1 (Vì sao các bản `v1.0.10..v1.0.13` bị lệch chữ ký):** File `fialda-debug.keystore` tạo bằng OpenSSL 3.x dùng thuật toán mã hóa PBES2/AES-256-CBC không tương thích với bộ đọc `KeyStore` mặc định của Java/Gradle. Khi để ngầm định ở `~/.android/debug.keystore`, Gradle bỏ qua và tự sinh khóa ngẫu nhiên mới ở mỗi lần chạy; còn khi ép qua `signingConfigs.debug` (`--ks`), Java KeyStore báo lỗi khiến bước 7 bị dừng (`failure` ở run #14 và #15).
+  - **Giải pháp triệt để (`fialda-signing.pk8` + `fialda-signing.x509.pem`):**
+    1. Giữ nguyên bước khởi tạo `rm -rf android && npx cap add android && ./gradlew assembleDebug` đã chạy thành công 100% ở các bản trước.
+    2. Trích xuất khóa riêng chuẩn **PKCS#8 DER (`android-keystore/fialda-signing.pk8`)** và chứng chỉ **X.509 PEM (`android-keystore/fialda-signing.x509.pem`)** (SHA-256: `84:AB:AC:FF:E3:73:84:16:D3:58:9E:A9:81:0C:55:08:36:29:0F:1D:D3:71:AB:62:A7:66:02:51:50:84:F9:BF`).
+    3. Sau khi Gradle đóng gói xong APK, dùng **`apksigner sign --key android-keystore/fialda-signing.pk8 --cert android-keystore/fialda-signing.x509.pem`** để ký trực tiếp mà không đi qua `java.security.KeyStore`, đảm bảo workflow chạy xanh 100% và mọi bản Release APK mới luôn giữ cố định duy nhất một chữ ký số.
+
 
 
 

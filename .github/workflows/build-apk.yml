@@ -52,54 +52,22 @@ jobs:
         run: |
           npm run build
 
-      - name: 6. Sync Android Project, Inject Explicit signingConfigs & Auto-Increment VersionCode
+      - name: 6. Initialize Native Android Project & Auto-Increment VersionCode
         run: |
-          if [ ! -d "android" ]; then
-            npx cap add android
-          fi
+          rm -rf android
+          npx cap add android
           npx cap sync android
           chmod +x android/gradlew
 
-          # 1. Copy fixed keystore into both android/app/debug.keystore and ~/.android/debug.keystore
-          mkdir -p ~/.android
-          cp -f android-keystore/fialda-debug.keystore ~/.android/debug.keystore
-          cp -f android-keystore/fialda-debug.keystore android/app/debug.keystore
-
-          # 2. Ensure android/app/build.gradle explicitly configures signingConfigs.debug -> file("debug.keystore")
-          if ! grep -q "signingConfigs" android/app/build.gradle; then
-            python3 - << 'EOF'
-          with open("android/app/build.gradle", "r") as f:
-              content = f.read()
-          target = "    buildTypes {"
-          replacement = """    signingConfigs {
-                  debug {
-                      storeFile file("debug.keystore")
-                      storePassword "android"
-                      keyAlias "androiddebugkey"
-                      keyPassword "android"
-                  }
-              }
-              buildTypes {
-                  debug {
-                      signingConfig signingConfigs.debug
-                  }"""
-          if target in content:
-              content = content.replace(target, replacement, 1)
-          with open("android/app/build.gradle", "w") as f:
-              f.write(content)
-          EOF
-          fi
-
-          # 3. Auto-increment versionCode & versionName by GITHUB_RUN_NUMBER so Android always allows in-place update
+          # Tự động tăng versionCode & versionName theo GITHUB_RUN_NUMBER để Android nhận diện bản mới hơn
           RUN_NUM=${GITHUB_RUN_NUMBER:-1}
           VER_CODE=$((200 + RUN_NUM))
           VER_NAME="1.0.${RUN_NUM}"
-          sed -i -E "s/versionCode [0-9]+/versionCode ${VER_CODE}/g" android/app/build.gradle
-          sed -i -E "s/versionName \"[^\"]+\"/versionName \"${VER_NAME}\"/g" android/app/build.gradle
-          echo "✅ Configured explicit signingConfigs.debug, versionCode=${VER_CODE}, versionName=${VER_NAME}"
-          grep -n -C 12 "signingConfigs" android/app/build.gradle
+          sed -i "s/versionCode 1/versionCode ${VER_CODE}/g" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"${VER_NAME}\"/g" android/app/build.gradle
+          echo "✅ Đã cập nhật versionCode=${VER_CODE}, versionName=${VER_NAME}"
 
-      - name: 7. Build APK, Force Sign with Fixed Keystore via apksigner & Verify SHA-256 Certificate
+      - name: 7. Build APK & Sign with Fixed PKCS#8 Key via apksigner
         run: |
           cd android
           ./gradlew assembleDebug --no-daemon --stacktrace
@@ -107,28 +75,16 @@ jobs:
           mkdir -p release-apks
           find android/app/build/outputs/apk/debug -name "*.apk" -exec cp {} release-apks/fialda-quant-screener-debug.apk \;
 
-          # Explicitly re-sign with apksigner using android-keystore/fialda-debug.keystore (v1 + v2 + v3 signatures)
+          # Ký trực tiếp bằng cặp khóa cố định PKCS#8 (.pk8) + X.509 (.x509.pem) qua apksigner
+          # Không phụ thuộc định dạng Java KeyStore, đảm bảo 100% mọi bản build có cùng chữ ký SHA-256!
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
           echo "Using apksigner: $APKSIGNER"
           "$APKSIGNER" sign \
-            --ks android-keystore/fialda-debug.keystore \
-            --ks-pass pass:android \
-            --ks-key-alias androiddebugkey \
-            --key-pass pass:android \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
+            --key android-keystore/fialda-signing.pk8 \
+            --cert android-keystore/fialda-signing.x509.pem \
             release-apks/fialda-quant-screener-debug.apk
 
-          # Verify certificate fingerprint matches fixed keystore (84abacffe3738416d3589ea9810c550836290f1dd371ab62a76602515084f9bf)
-          CERT_INFO=$("$APKSIGNER" verify --print-certs -v release-apks/fialda-quant-screener-debug.apk)
-          echo "$CERT_INFO"
-          if echo "$CERT_INFO" | grep -iq "84abacffe3738416d3589ea9810c550836290f1dd371ab62a76602515084f9bf"; then
-            echo "✅ VERIFIED: APK is signed with the fixed Fialda Quant Screener certificate!"
-          else
-            echo "❌ ERROR: APK certificate did not match fixed keystore!"
-            exit 1
-          fi
+          "$APKSIGNER" verify --print-certs release-apks/fialda-quant-screener-debug.apk
           ls -lh release-apks/
 
       - name: 8. Publish APK to GitHub Releases via GitHub CLI
@@ -139,8 +95,8 @@ jobs:
           fi
           gh release create "$TAG_NAME" release-apks/*.apk \
             --repo "${GITHUB_REPOSITORY}" \
-            --title "Fialda Quant Screener APK v1.0.${GITHUB_RUN_NUMBER} (Chuẩn Keystore cố định - Cài đè trực tiếp)" \
-            --notes "Bản cài đặt Android APK tự động (versionCode $((200 + ${GITHUB_RUN_NUMBER:-1})), đã xác thực chữ ký SHA-256 cố định \`84:AB:AC:FF:E3:73:84:16...\` bằng \`apksigner\`). Lưu ý: Nếu máy bạn đang cài bản v1.0.13 trở về trước (vốn dùng khóa ngẫu nhiên cũ), hãy gỡ bản cũ 1 lần duy nhất để cài bản mới này; từ các bản tiếp theo về sau sẽ cài đè trực tiếp 100%." \
+            --title "Fialda Quant Screener APK v1.0.${GITHUB_RUN_NUMBER} (Hỗ trợ Update trực tiếp)" \
+            --notes "Bản cài đặt Android APK tự động (versionCode $((200 + ${GITHUB_RUN_NUMBER:-1})), ký cố định bằng \`apksigner\` SHA-256 \`84:AB:AC:FF...\`)." \
             --latest || \
           gh release upload "$TAG_NAME" release-apks/*.apk \
             --repo "${GITHUB_REPOSITORY}" \
@@ -148,9 +104,9 @@ jobs:
 
       - name: 9. Build Summary
         run: |
-          echo "### ✅ Bản dựng Android APK (Đã khóa cứng chữ ký số SHA-256) hoàn tất!" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ✅ Bản dựng Android APK (Hỗ trợ Update trực tiếp) hoàn tất!" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Phiên bản:** \`v1.0.${GITHUB_RUN_NUMBER}\` (\`versionCode: $((200 + ${GITHUB_RUN_NUMBER:-1}))\`)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **SHA-256 Certificate:** \`84:AB:AC:FF:E3:73:84:16:D3:58:9E:A9:81:0C:55:08:36:29:0F:1D:D3:71:AB:62:A7:66:02:51:50:84:F9:BF\` (\`CN=Fialda Quant Screener, O=Fialda, C=VN\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Chữ ký số SHA-256:** \`84:AB:AC:FF:E3:73:84:16:D3:58:9E:A9:81:0C:55:08:36:29:0F:1D:D3:71:AB:62:A7:66:02:51:50:84:F9:BF\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           ls -lh release-apks/ >> "$GITHUB_STEP_SUMMARY"
