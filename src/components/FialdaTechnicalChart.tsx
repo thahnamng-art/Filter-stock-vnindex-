@@ -1347,7 +1347,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                   ? 'bg-rose-500/20 text-rose-300 border-rose-500/50'
                   : 'bg-[#181c27] text-slate-500 border-[#262b38] hover:text-slate-300'
               }`}
-              title="Bật/Tắt Tín hiệu BÁN độc lập (Khi MCDX hiện tại rớt >25% so với đỉnh MCDX 10 phiên trước)"
+              title="Bật/Tắt Tín hiệu BÁN độc lập (Khi MCDX hiện tại mất ≥ 25 điểm so với đỉnh MCDX 10 phiên liền trước)"
             >
               <span className="text-[9px] leading-none">▼</span>
               <span>Bán</span>
@@ -1400,7 +1400,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                   className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg text-[11px] hover:bg-[#222a3d] transition-colors border-b border-[#252d40] pb-2 mb-1"
                 >
                   <span className={showSellSignals ? 'text-rose-300 font-semibold' : 'text-slate-500'}>
-                    ▼ Tín hiệu Bán (MCDX giảm &gt;25% từ đỉnh 10P)
+                    ▼ Tín hiệu Bán (MCDX mất &ge;25đ từ đỉnh 10P)
                   </span>
                   <span className={`w-2 h-2 rounded-full ${showSellSignals ? 'bg-rose-400' : 'bg-slate-600'}`} />
                 </button>
@@ -2053,7 +2053,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                           : 'bg-amber-400/90 text-slate-950'
                       }`}
                     >
-                      ▼ BÁN -{activePoint.sellSignalLevel}% (MCDX {activePoint.mcdxBanker.toFixed(1)} vs Đỉnh 10P:{' '}
+                      ▼ BÁN -{activePoint.sellSignalLevel}đ (MCDX {activePoint.mcdxBanker.toFixed(1)} vs Đỉnh 10P:{' '}
                       {activePoint.sellSignalPeak10?.toFixed(1)})
                     </span>
                   )}
@@ -2077,10 +2077,10 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                     )}
                     {showSellSignals && (
                       <span className="inline-flex items-center gap-1">
-                        <span className="text-slate-300 font-semibold">Bán (MCDX -25% Đỉnh 10P):</span>
-                        <span className="text-amber-400 font-bold">▼-25%</span>
-                        <span className="text-orange-400 font-bold">▼-35%</span>
-                        <span className="text-rose-400 font-bold">▼-50%+</span>
+                        <span className="text-slate-300 font-semibold">Bán (MCDX mất ≥25đ từ Đỉnh 10P):</span>
+                        <span className="text-amber-400 font-bold">▼-25đ</span>
+                        <span className="text-orange-400 font-bold">▼-35đ</span>
+                        <span className="text-rose-400 font-bold">▼-50đ+</span>
                       </span>
                     )}
                   </div>
@@ -2363,7 +2363,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                           </div>
                         )}
 
-                        {/* Independent SELL Signal Marker (above candle high: MCDX drops >25% from 10-bar peak) */}
+                        {/* Independent SELL Signal Marker (above candle high: MCDX loses >= 25 points from 10-bar peak) */}
                         {hasSell && p.sellSignalLevel && (
                           <div
                             style={{
@@ -2381,7 +2381,7 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                                   : 'bg-amber-400/95 text-slate-950'
                               }`}
                             >
-                              -{p.sellSignalLevel}%
+                              -{p.sellSignalLevel}đ
                             </span>
                             <span
                               className={`text-[9px] leading-none drop-shadow ${

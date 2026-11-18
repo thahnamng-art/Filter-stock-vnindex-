@@ -43,8 +43,8 @@ export interface ComputedChartPoint extends OhlcvCandle {
   buySignalLevel: 25 | 50 | 75 | null;
   // Whether this bar also satisfies the strict >= 100B VND value & RS52w >= 70 criteria
   buySignalPassesStrictValue: boolean;
-  // Sell Signal (Independent): MCDX Banker drops > 25% compared to max MCDX of previous 10 sessions
-  sellSignalLevel: number | null; // Drop % from 10-session peak (e.g. 28 means -28%)
+  // Sell Signal (Independent): MCDX Banker loses >= 25 points compared to max MCDX of previous 10 sessions
+  sellSignalLevel: number | null; // Points lost from 10-session peak (e.g. 28 means -28 points from peak)
   sellSignalPeak10: number | null; // Highest MCDX Banker in the previous 10 sessions
   // 7. VNINDEX synchronized candle
   vnindexOpen: number;
@@ -989,8 +989,8 @@ export function computeFullTechnicalChart(
 
     // -------------------------------------------------------------------------
     // 2. INDEPENDENT SELL SIGNAL:
-    //    Triggers when current MCDX Banker drops > 25% compared to the highest
-    //    MCDX Banker in the previous 10 sessions (currBanker < maxPrev10Banker * 0.75)
+    //    Triggers when current MCDX Banker loses >= 25 points compared to the
+    //    highest MCDX Banker in the previous 10 sessions (maxPrev10Banker - currBanker >= 25)
     // -------------------------------------------------------------------------
     let maxPrev10Banker = 0;
     const start10 = Math.max(0, i - 10);
@@ -1012,16 +1012,17 @@ export function computeFullTechnicalChart(
 
     let sellSignalLevel: number | null = null;
     const sellSignalPeak10 = i > 0 ? Math.round(maxPrev10Banker * 10) / 10 : null;
+    const pointsLostFromPeak10 = maxPrev10Banker - currBanker;
+    const prevPointsLostFromPeak10 = prevMax10Banker - prevBanker;
+
     if (
       i > 0 &&
-      maxPrev10Banker >= 5 &&
-      currBanker < maxPrev10Banker * 0.75 &&
-      (i === 1 || prevBanker >= prevMax10Banker * 0.75)
+      maxPrev10Banker >= 25 &&
+      currBanker < prevBanker &&
+      pointsLostFromPeak10 >= 25 &&
+      (i === 1 || prevPointsLostFromPeak10 < 25)
     ) {
-      sellSignalLevel = Math.max(
-        25,
-        Math.round(((maxPrev10Banker - currBanker) / maxPrev10Banker) * 100)
-      );
+      sellSignalLevel = Math.max(25, Math.round(pointsLostFromPeak10));
     }
 
     points[i] = {
