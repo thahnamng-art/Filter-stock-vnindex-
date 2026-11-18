@@ -216,12 +216,16 @@ export const GithubPublishModal: React.FC<GithubPublishModalProps> = ({
               </button>
             </div>
 
-            <div className="flex items-center gap-2 text-[11px] text-emerald-300/90 bg-emerald-950/40 border border-emerald-800/40 rounded-lg px-3 py-1.5">
-              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>
-                Bản APK được ký bằng <strong>Keystore cố định</strong> — điện thoại Android cho phép{' '}
-                <strong>cài đè / cập nhật trực tiếp</strong> lên bản cũ mà không cần gỡ cài đặt.
-              </span>
+            <div className="flex items-start gap-2 text-[11px] text-emerald-300/90 bg-emerald-950/40 border border-emerald-800/40 rounded-lg px-3 py-2 leading-relaxed">
+              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+              <div>
+                <p>
+                  Bản APK được ký trực tiếp bằng <strong>apksigner (Keystore cố định SHA-256: <code className="text-[10px]">84:AB:AC:FF...</code>)</strong> — hỗ trợ <strong>cài đè / cập nhật trực tiếp</strong> mà không cần gỡ cài đặt.
+                </p>
+                <p className="text-amber-300/95 mt-1 text-[10.5px]">
+                  *Lưu ý chuyển tiếp 1 lần: Nếu điện thoại của bạn đang cài các bản cũ từ <strong>v1.0.13 trở về trước</strong> (vốn bị Gradle sinh khóa ngẫu nhiên theo từng máy ảo GitHub), bạn hãy <strong>gỡ bản cũ 1 lần duy nhất</strong> rồi cài bản mới từ <strong>v1.0.14+</strong> trở đi. Từ sau lần đó, mọi bản cập nhật mới đều cài đè trực tiếp 100%.
+                </p>
+              </div>
             </div>
           </div>
 
