@@ -1,12 +1,22 @@
-import { StockData, ExchangeType, getVietnamTodayDateStr } from '../types/screener';
+import {
+  StockData,
+  ExchangeType,
+  getVietnamTodayDateStr,
+  getVietnamDateByTradingOffset
+} from '../types/screener';
 import REAL_STOCKS_DATA from './realMarketData.json';
 import {
+  EMBEDDED_BASELINE_DATE,
   DeltaHistoricalCandle,
   StockDeltaCacheItem,
   IntradayT0Quote,
   hydrateDeltaCacheToRAM,
   saveStockDeltaCachesBatch,
-  buildStocksFromRamDeltaCache
+  buildStocksFromRamDeltaCache,
+  inspectDeltaCacheFreshness,
+  getItemEffectiveDate,
+  dateStrToUnixSec,
+  setKnownLatestMarketDate
 } from '../services/marketCacheStorage';
 
 interface RawStockItem {
@@ -28,7 +38,12 @@ interface RawStockItem {
   historical_volumes: number[];
 }
 
-export type SyncScopeMode = 'INTRADAY_T0_ONLY' | 'DELTA_ADJUSTED' | 'FAST_200' | 'BY_EXCHANGE' | 'FULL_1626';
+export type SyncScopeMode =
+  | 'INTRADAY_T0_ONLY'
+  | 'DELTA_ADJUSTED'
+  | 'FAST_200'
+  | 'BY_EXCHANGE'
+  | 'FULL_1626';
 
 export interface SyncLogItem {
   symbol: string;
@@ -42,6 +57,9 @@ export interface SyncLogItem {
   totalVolume: number;
   totalValue: number;
   barsCount: number;
+  missingCandlesAdded?: number;
+  fromCacheDate?: string;
+  toLatestDate?: string;
   status: 'T0_CACHE_HIT' | 'ADJUSTED_REFRESH' | 'LIVE_HTTP' | 'EMBEDDED_REAL';
   timestamp: string;
 }
@@ -62,6 +80,16 @@ export interface SyncBatchProgress {
   recentLogs: SyncLogItem[];
   exchangeDone: { HOSE: number; HNX: number; UPCOM: number };
 }
+
+export interface MarketIndexLiveStatus {
+  latestMarketDate: string;
+  vnIndexClose: number;
+  vnIndexChange: number;
+  vnIndexChangePct: number;
+}
+
+// Mặc định 45 mã/lô -> 1.626 mã chia thành đúng 36-37 lô cực nhanh (như bản 36 lô)
+export const DEFAULT_SYNC_BATCH_SIZE = 45;
 
 function expandTo260Bars(recentCloses: number[], price52wAgo?: number): number[] {
   if (recentCloses.length >= 260) {
@@ -127,10 +155,12 @@ export interface SyncOptions {
   targetExchanges?: ExchangeType[];
   batchSize?: number;
   timeoutMs?: number;
-  skipInvalidationCheck?: boolean; // Nếu true: chỉ gọi đúng 1 API T0 (size=2000) và ghép nến trên RAM
+  forceManualSync?: boolean;
+  skipInvalidationCheck?: boolean;
   shouldAbort?: () => boolean;
   onProgress?: (completed: number, total: number) => void;
   onBatchProgress?: (progress: SyncBatchProgress) => void;
+  onMarketIndexUpdate?: (indexStatus: MarketIndexLiveStatus) => void;
   onIncrementalStocksUpdate?: (
     stocksSnapshot: StockData[],
     meta: {
@@ -148,150 +178,105 @@ export interface SyncOptions {
 function normalizePrice(val: any, fallback = 0): number {
   const num = Number(val);
   if (!Number.isFinite(num) || num <= 0) return fallback;
-  // VNDirect finfo-api trả đơn vị nghìn đồng (ví dụ 25.45), nếu trả đồng (> 1000) thì quy về nghìn đồng
   const normalized = num > 1000 ? num / 1000 : num;
   return Math.round(normalized * 100) / 100;
 }
 
-function getPastIsoDateStr(daysAgo: number): string {
-  const d = new Date(Date.now() - daysAgo * 86400 * 1000);
-  return d.toISOString().slice(0, 10);
-}
-
-async function fetchJsonWithCorsFallback(targetUrl: string, timeoutMs: number): Promise<any | null> {
-  const tryFetch = async (url: string, ms: number) => {
+/**
+ * Gọi HTTP JSON KHÔNG gắn custom header `Accept: application/json`
+ * (vì cổng dchart-api của VNDirect trả Content-Type: text/plain và sẽ báo lỗi 406 nếu ép Accept: application/json).
+ * Tự động retry trực tiếp 4 lần với tham số `_r` để vượt qua node load-balancer lỗi SymbolInfo của VNDirect trong ~60-90ms.
+ */
+async function fetchJsonDirectWithRetry(
+  targetUrl: string,
+  timeoutMs: number,
+  directRetries = 4
+): Promise<any | null> {
+  const tryFetch = async (url: string, ms: number): Promise<any | null> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ms);
     try {
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' }
-      });
+      const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
       if (!res.ok) return null;
-      return await res.json();
+      const text = (await res.text()).trim();
+      if (!text || (!text.startsWith('{') && !text.startsWith('['))) {
+        return null;
+      }
+      return JSON.parse(text);
     } catch {
       clearTimeout(timer);
       return null;
     }
   };
 
-  // 1. Gọi trực tiếp VNDirect API
-  const direct = await tryFetch(targetUrl, timeoutMs);
-  if (direct) return direct;
-
-  // 2. Fallback qua CORS proxy nếu trình duyệt chặn CORS trực tiếp
-  const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
-  return await tryFetch(proxyUrl, Math.min(timeoutMs + 1200, 5500));
+  const perAttemptMs = Math.max(1200, Math.floor(timeoutMs / Math.max(1, directRetries - 1)));
+  for (let attempt = 0; attempt < directRetries; attempt++) {
+    const sep = targetUrl.includes('?') ? '&' : '?';
+    const urlWithRetry =
+      attempt === 0 ? targetUrl : `${targetUrl}${sep}_r=${attempt}_${Date.now() % 10000}`;
+    const okJson = await tryFetch(urlWithRetry, perAttemptMs);
+    if (okJson) return okJson;
+  }
+  return null;
 }
 
 /**
- * BƯỚC 2 (DELTA CACHING):
- * Chỉ gọi 1 API duy nhất lấy bảng giá snapshot ngày hôm nay (T0) của toàn thị trường (size=2000)
- * từ cổng VNDirect finfo-api v4 stock_prices.
+ * BƯỚC 2 (Khi mở app hoặc bấm Filter):
+ * Chạy 1 request cực nhẹ (< 100ms) kiểm tra chỉ số VNINDEX trên VNDirect để biết chính xác
+ * có phiên giao dịch mới hơn dữ liệu đang lưu trong Cache hay không.
  */
-export async function fetchMarketIntradayT0Snapshot(
-  timeoutMs = 4200
-): Promise<{
-  t0Map: Map<string, IntradayT0Quote>;
-  t0Date: string;
-}> {
-  const todayStr = getVietnamTodayDateStr();
-  const lookback7dStr = getPastIsoDateStr(7);
+export async function checkLatestMarketTradingDateFromVNDirect(
+  timeoutMs = 2400
+): Promise<MarketIndexLiveStatus | null> {
+  const toSec = Math.floor(Date.now() / 1000);
+  const fromSec = toSec - 15 * 86400;
+  const url = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=VNINDEX&from=${fromSec}&to=${toSec}`;
+  const data = await fetchJsonDirectWithRetry(url, timeoutMs, 4);
 
-  // Ưu tiên lấy snapshot phiên giao dịch mới nhất toàn thị trường với size=2000 trong 1 request duy nhất
-  const urlsToTry = [
-    `https://finfo-api.vndirect.com.vn/v4/stock_prices?sort=date:desc&q=date:${todayStr}&size=2000`,
-    `https://finfo-api.vndirect.com.vn/v4/stock_prices?sort=date:desc&q=date:gte:${lookback7dStr}&size=2000`
-  ];
-
-  const t0Map = new Map<string, IntradayT0Quote>();
-  let detectedT0Date = todayStr;
-
-  for (const url of urlsToTry) {
-    const json = await fetchJsonWithCorsFallback(url, timeoutMs);
-    const rows = json?.data;
-    if (Array.isArray(rows) && rows.length > 0) {
-      // Xác định ngày giao dịch mới nhất T0 từ bản ghi đầu tiên
-      const latestDate = String(rows[0].date || todayStr).slice(0, 10);
-      detectedT0Date = latestDate;
-
-      for (const row of rows) {
-        const sym = String(row.code || '').trim().toUpperCase();
-        const rowDate = String(row.date || '').slice(0, 10);
-        if (!sym || rowDate !== latestDate || t0Map.has(sym)) continue;
-
-        const close = normalizePrice(row.close ?? row.adClose ?? row.basicPrice);
-        if (close <= 0) continue;
-
-        const basicPrice = normalizePrice(row.basicPrice, close);
-        const open = normalizePrice(row.open, basicPrice);
-        const high = normalizePrice(row.high, Math.max(open, close));
-        const low = normalizePrice(row.low, Math.min(open, close));
-        const average = normalizePrice(row.average ?? row.adAverage, Math.round(((open + high + low + close) / 4) * 100) / 100);
-        const volume = Math.max(0, Math.round(Number(row.nmVolume ?? row.volume ?? 0)));
-        const rawVal = Number(row.nmValue ?? row.value ?? 0);
-        const totalValueB =
-          rawVal > 0
-            ? Math.round((rawVal / 1e9) * 10) / 10
-            : Math.round(((volume * close * 1000) / 1e9) * 10) / 10;
-
-        const change =
-          row.change !== undefined
-            ? Math.round(Number(row.change > 100 || row.change < -100 ? row.change / 1000 : row.change) * 100) / 100
-            : Math.round((close - basicPrice) * 100) / 100;
-        const changePct =
-          row.pctChange !== undefined
-            ? Math.round(Number(row.pctChange) * 100) / 100
-            : basicPrice > 0
-            ? Math.round(((close - basicPrice) / basicPrice) * 10000) / 100
-            : 0;
-
-        const floorStr = String(row.floor || 'HOSE').toUpperCase();
-        const exchange: ExchangeType =
-          floorStr.includes('HNX') ? 'HNX' : floorStr.includes('UPCOM') ? 'UPCOM' : 'HOSE';
-
-        t0Map.set(sym, {
-          symbol: sym,
-          exchange,
-          date: latestDate,
-          basicPrice,
-          open,
-          high,
-          low,
-          close,
-          average,
-          volume,
-          totalValueB,
-          change,
-          changePct
-        });
-      }
-
-      if (t0Map.size > 0) {
-        break;
-      }
-    }
+  if (!data || data.s !== 'ok' || !Array.isArray(data.t) || data.t.length === 0) {
+    return null;
   }
 
-  return { t0Map, t0Date: detectedT0Date };
+  const len = data.t.length;
+  const lastTs = Number(data.t[len - 1] || 0);
+  if (lastTs <= 0) return null;
+
+  const latestMarketDate = new Date((lastTs + 7 * 3600) * 1000).toISOString().slice(0, 10);
+  setKnownLatestMarketDate(latestMarketDate);
+
+  const lastClose = Math.round(Number(data.c?.[len - 1] || 1743.07) * 100) / 100;
+  const prevClose =
+    len >= 2 ? Math.round(Number(data.c?.[len - 2] || lastClose) * 100) / 100 : lastClose;
+  const vnIndexChange = Math.round((lastClose - prevClose) * 100) / 100;
+  const vnIndexChangePct =
+    prevClose > 0 ? Math.round(((lastClose - prevClose) / prevClose) * 10000) / 100 : 0;
+
+  return {
+    latestMarketDate,
+    vnIndexClose: lastClose,
+    vnIndexChange,
+    vnIndexChangePct
+  };
 }
 
 /**
- * Fallback lấy lịch sử 1 mã từ dchart API khi cần
+ * Lấy chuỗi nến từ dchart-api.vndirect.com.vn/dchart/history theo khoảng thời gian [fromSec, toSec]
+ * (Chỉ lấy đúng khoảng thời gian còn thiếu từ lastSyncDate -> hôm nay, hoặc 380 ngày nếu mã có điều chỉnh giá).
  */
-async function fetchVNDirectDChartSingleFallback(
+async function fetchVNDirectDChartCandles(
   symbol: string,
   fromSec: number,
   toSec: number,
-  timeoutMs: number
+  timeoutMs: number,
+  minCandles = 1
 ): Promise<DeltaHistoricalCandle[] | null> {
   const targetUrl = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
     symbol
   )}&from=${fromSec}&to=${toSec}`;
 
-  const data = await fetchJsonWithCorsFallback(targetUrl, timeoutMs);
-  if (!data || data.s !== 'ok' || !Array.isArray(data.c) || data.c.length < 20) {
+  const data = await fetchJsonDirectWithRetry(targetUrl, timeoutMs, 4);
+  if (!data || data.s !== 'ok' || !Array.isArray(data.c) || data.c.length < minCandles) {
     return null;
   }
 
@@ -299,13 +284,17 @@ async function fetchVNDirectDChartSingleFallback(
   const candles: DeltaHistoricalCandle[] = [];
   for (let i = 0; i < len; i++) {
     const c = normalizePrice(data.c[i]);
+    if (c <= 0) continue;
     const o = normalizePrice(data.o?.[i], c);
     const h = normalizePrice(data.h?.[i], Math.max(o, c));
     const l = normalizePrice(data.l?.[i], Math.min(o, c));
     const avg = Math.round(((o + h + l + c) / 4) * 100) / 100;
     const v = Math.max(0, Math.round(Number(data.v?.[i] ?? 0)));
     const ts = Number(data.t?.[i] ?? 0);
-    const dateStr = ts > 0 ? new Date(ts * 1000).toISOString().slice(0, 10) : `D-${len - i}`;
+    const dateStr =
+      ts > 0
+        ? new Date((ts + 7 * 3600) * 1000).toISOString().slice(0, 10)
+        : `D-${len - i}`;
     candles.push({
       date: dateStr,
       open: o,
@@ -316,154 +305,128 @@ async function fetchVNDirectDChartSingleFallback(
       volume: v
     });
   }
-  return candles;
+  return candles.length >= minCandles ? candles : null;
 }
 
 /**
- * BƯỚC 3 (CACHE INVALIDATION BATCH FETCH):
- * Gom 15-20 mã cần làm mới thành 1 request dùng toán tử `code:MÃ1,MÃ2...` của VNDirect finfo-api
- * để tải lại full lịch sử (~200-250 phiên) đã điều chỉnh giá.
+ * Chuẩn hóa bản ghi StockDeltaCacheItem từ danh sách nến lịch sử đầy đủ (tách T-1 và T0)
  */
-async function fetchAdjustedHistoryBatchFinfo(
-  symbolsBatch: string[],
-  fromDateStr: string,
-  timeoutMs = 4500
-): Promise<Map<string, DeltaHistoricalCandle[]>> {
-  const resultMap = new Map<string, DeltaHistoricalCandle[]>();
-  if (symbolsBatch.length === 0) return resultMap;
+function buildDeltaCacheItemFromCandles(
+  symbol: string,
+  exchange: ExchangeType,
+  allCandles: DeltaHistoricalCandle[],
+  t0Quote?: IntradayT0Quote
+): { item: StockDeltaCacheItem; latestDate: string } {
+  const lastCandle = allCandles[allCandles.length - 1];
+  const latestDate = t0Quote?.date || lastCandle.date;
 
-  const codeQuery = symbolsBatch.join(',');
-  const url = `https://finfo-api.vndirect.com.vn/v4/stock_prices?sort=date:asc&q=code:${codeQuery}~date:gte:${fromDateStr}&size=5000`;
-
-  const json = await fetchJsonWithCorsFallback(url, timeoutMs);
-  const rows = json?.data;
-
-  if (Array.isArray(rows) && rows.length > 0) {
-    for (const row of rows) {
-      const sym = String(row.code || '').trim().toUpperCase();
-      const dateStr = String(row.date || '').slice(0, 10);
-      if (!sym || !dateStr) continue;
-
-      // Sử dụng giá đã điều chỉnh (adClose, adOpen, adHigh, adLow, adAverage) để xử lý cổ tức/chia tách
-      const close = normalizePrice(row.adClose ?? row.close);
-      if (close <= 0) continue;
-      const open = normalizePrice(row.adOpen ?? row.open, close);
-      const high = normalizePrice(row.adHigh ?? row.high, Math.max(open, close));
-      const low = normalizePrice(row.adLow ?? row.low, Math.min(open, close));
-      const average = normalizePrice(
-        row.adAverage ?? row.average,
-        Math.round(((open + high + low + close) / 4) * 100) / 100
-      );
-      const volume = Math.max(0, Math.round(Number(row.nmVolume ?? row.volume ?? 0)));
-
-      let list = resultMap.get(sym);
-      if (!list) {
-        list = [];
-        resultMap.set(sym, list);
-      }
-      // Tránh trùng ngày
-      if (list.length === 0 || list[list.length - 1].date !== dateStr) {
-        list.push({
-          date: dateStr,
-          open,
-          high,
-          low,
-          close,
-          average,
-          volume
-        });
-      }
-    }
+  // Tách lịch sử đã chốt T-1 (các phiên trước phiên mới nhất, khoảng 200-250 phiên)
+  let t1Candles = allCandles.filter((c) => c.date < latestDate).slice(-250);
+  if (t1Candles.length < 15 && allCandles.length >= 2) {
+    t1Candles = allCandles.slice(0, -1).slice(-250);
+  } else if (t1Candles.length === 0) {
+    t1Candles = allCandles.slice(-250);
   }
 
-  // Nếu có mã nào trong batch chưa lấy được từ finfo-api (hoặc bị chặn), fallback sang dchart cho mã đó
-  const missingSymbols = symbolsBatch.filter((s) => {
-    const arr = resultMap.get(s);
-    return !arr || arr.length < 20;
-  });
+  const lastT1 = t1Candles[t1Candles.length - 1] || lastCandle;
+  const lastClose =
+    t0Quote && exchange !== 'UPCOM' ? t0Quote.basicPrice || lastT1.close : lastT1.close;
+  const lastAvgPrice =
+    t0Quote && exchange === 'UPCOM' ? t0Quote.basicPrice || lastT1.average : lastT1.average;
 
-  if (missingSymbols.length > 0) {
-    const toSec = Math.floor(Date.now() / 1000);
-    const fromSec = toSec - 360 * 86400;
-    await Promise.all(
-      missingSymbols.map(async (sym) => {
-        const dchartCandles = await fetchVNDirectDChartSingleFallback(sym, fromSec, toSec, 2800);
-        if (dchartCandles && dchartCandles.length >= 20) {
-          resultMap.set(sym, dchartCandles);
-        }
-      })
-    );
-  }
+  const refPriceForChange = exchange === 'UPCOM' ? lastT1.average || lastT1.close : lastT1.close;
 
-  return resultMap;
-}
-
-/**
- * Hàm gọi nhanh Intraday T0 khi user bấm Filter trong ngày:
- * - Nạp/dùng lại toàn bộ lịch sử T-1 từ IndexedDB/RAM (tuyệt đối không fetch lại lịch sử).
- * - Chỉ gọi đúng 1 API duy nhất lấy bảng giá T0 toàn thị trường (size=2000).
- * - Ghép cây nến T0 vào cuối mảng lịch sử trên RAM rồi trả về ngay.
- */
-export async function syncIntradayT0FastOnFilter(
-  currentStocks: StockData[]
-): Promise<{
-  stocks: StockData[];
-  t0Date: string;
-  t0Count: number;
-  cacheHitCount: number;
-}> {
-  const { cacheMap } = await hydrateDeltaCacheToRAM(currentStocks);
-  const { t0Map, t0Date } = await fetchMarketIntradayT0Snapshot(3800);
-
-  if (t0Map.size > 0) {
-    const updatedCacheItems: StockDeltaCacheItem[] = [];
-    for (const [sym, quote] of t0Map.entries()) {
-      const existing = cacheMap.get(sym);
-      if (existing) {
-        existing.pendingT0 = {
-          date: quote.date,
-          open: quote.open,
-          high: quote.high,
-          low: quote.low,
-          close: quote.close,
-          average: quote.average,
-          volume: quote.volume,
-          basicPrice: quote.basicPrice,
-          change: quote.change,
-          changePct: quote.changePct,
-          totalValueB: quote.totalValueB
-        };
-        updatedCacheItems.push(existing);
+  const activeT0 = t0Quote
+    ? {
+        date: t0Quote.date,
+        open: t0Quote.open,
+        high: t0Quote.high,
+        low: t0Quote.low,
+        close: t0Quote.close,
+        average: t0Quote.average,
+        volume: t0Quote.volume,
+        basicPrice: t0Quote.basicPrice,
+        change: t0Quote.change,
+        changePct: t0Quote.changePct,
+        totalValueB: t0Quote.totalValueB
       }
-    }
+    : {
+        date: lastCandle.date,
+        open: lastCandle.open,
+        high: lastCandle.high,
+        low: lastCandle.low,
+        close: lastCandle.close,
+        average: lastCandle.average,
+        volume: lastCandle.volume,
+        basicPrice: refPriceForChange,
+        change: Math.round((lastCandle.close - refPriceForChange) * 100) / 100,
+        changePct:
+          refPriceForChange > 0
+            ? Math.round(((lastCandle.close - refPriceForChange) / refPriceForChange) * 10000) / 100
+            : 0,
+        totalValueB: Math.round(((lastCandle.volume * lastCandle.close * 1000) / 1e9) * 10) / 10
+      };
 
-    await saveStockDeltaCachesBatch(updatedCacheItems, {
-      lastSyncDate: t0Date,
-      liveHttpCount: t0Map.size,
-      totalStocks: currentStocks.length,
-      t0SnapshotCount: t0Map.size,
-      invalidatedRefreshedCount: 0,
-      cacheHitCount: cacheMap.size
-    });
-  }
-
-  const mergedStocks = buildStocksFromRamDeltaCache(currentStocks, t0Map);
   return {
-    stocks: mergedStocks,
-    t0Date,
-    t0Count: t0Map.size,
-    cacheHitCount: cacheMap.size
+    latestDate,
+    item: {
+      symbol,
+      exchange,
+      lastSyncDate: lastT1.date,
+      lastClose,
+      lastAvgPrice,
+      candles: t1Candles,
+      verifiedT0Date: latestDate,
+      isBaselineSeed: false,
+      pendingT0: activeT0
+    }
   };
 }
 
 /**
- * Luồng Đồng bộ Delta Caching Toàn diện (3 Bước):
- * 1. Nạp toàn bộ cache lịch sử T-1 từ IndexedDB lên RAM.
- * 2. Gọi 1 API duy nhất lấy snapshot T0 (size=2000) của toàn thị trường và ghép vào RAM ngay lập tức.
- * 3. Đối chiếu basicPrice (HOSE/HNX so với cache.lastClose; UPCOM so với cache.lastAvgPrice):
- *    - Nếu chênh lệch <= 0.05: Dùng ngay lịch sử trong Cache (Cache Hit, 0 HTTP request).
- *    - Nếu chênh lệch > 0.05 (hoặc mã chưa đồng bộ): Gom thành từng batch 18 mã/request (15-20 mã)
- *      với toán tử `code:MÃ1,MÃ2...` của finfo-api để tải lại lịch sử đã điều chỉnh giá và ghi đè RAM + IndexedDB.
+ * Kiểm tra nhanh xem trên VNDirect có dữ liệu mới hơn Cache hiện tại không khi user bấm Filter:
+ * - Bước 1: Nạp Cache từ IndexedDB/RAM
+ * - Bước 2: Gọi 1 request nhẹ kiểm tra ngày giao dịch mới nhất của thị trường (VNINDEX)
+ * - Bước 3: Xét duyệt xem Cache đã ở ngày mới nhất chưa hay cần chạy cập nhật bù những ngày còn thiếu
+ */
+export async function checkAndDecideMarketDeltaSync(
+  currentStocks: StockData[]
+): Promise<{
+  stocks: StockData[];
+  latestMarketDate: string;
+  latestCachedDate: string;
+  missingDaysEstimate: number;
+  needsUpdate: boolean;
+  marketIndex: MarketIndexLiveStatus | null;
+}> {
+  await hydrateDeltaCacheToRAM(currentStocks);
+  const marketIndex = await checkLatestMarketTradingDateFromVNDirect(2400);
+  const targetMarketDate = marketIndex?.latestMarketDate || getVietnamDateByTradingOffset(0);
+  const freshness = inspectDeltaCacheFreshness(currentStocks.length, targetMarketDate);
+  const stocksFromRam = buildStocksFromRamDeltaCache(currentStocks);
+
+  return {
+    stocks: stocksFromRam,
+    latestMarketDate: targetMarketDate,
+    latestCachedDate: freshness.latestCachedDate,
+    missingDaysEstimate: freshness.missingDaysEstimate,
+    needsUpdate: freshness.needsUpdate,
+    marketIndex
+  };
+}
+
+/**
+ * Luồng Đồng Bộ Delta Caching Tối Ưu Tốc Độ (36 Lô - Chỉ tải tiếp khoảng thời gian còn thiếu):
+ * 1. Reload Data Cache Cũ từ IndexedDB lên RAM (các mã đã có ~210-250 phiên lịch sử tới lastSyncDate, ví dụ 10/11/2026).
+ * 2. Chạy kiểm tra có Data mới trên VNDirect không (qua 1 request VNINDEX < 100ms lấy latestMarketDate, ví dụ 18/11/2026).
+ * 3. Xét duyệt:
+ *    - Nếu mã đã có dữ liệu tới latestMarketDate (18/11/2026) và không ép cập nhật lại: Bỏ qua ngay (Cache Hit 0ms)!
+ *    - Nếu mã còn thiếu dữ liệu từ `lastSyncDate` đến `latestMarketDate`:
+ *      + Chỉ gọi lấy đúng **khoảng thời gian còn thiếu** (`from = lastSyncDate - 3 ngày` đến `now`, ví dụ chỉ ~6-7 cây nến từ 10/11 -> 18/11 thay vì 260 cây nến!).
+ *      + Tại điểm nối `lastSyncDate`, đối chiếu giá trên VNDirect với `cache.lastClose` (HOSE/HNX) hoặc `cache.lastAvgPrice` (UPCOM):
+ *        * Nếu chênh lệch `<= 0.05`: Không có điều chỉnh giá -> Nối (append) ngay các cây nến còn thiếu vào cuối mảng Cache trên RAM + IndexedDB!
+ *        * Nếu chênh lệch `> 0.05`: Mã có chia cổ tức / tách cổ phiếu -> Tự động tải lại full 250 phiên lịch sử đã điều chỉnh cho riêng mã đó!
+ *    - Chia 1.626 mã thành **36 lô (45 mã/lô)** chạy song song cực nhanh và cập nhật trực tiếp vào bộ lọc Filter sau mỗi lô!
  */
 export async function syncRealMarketDataFromVNDirect(
   currentStocks: StockData[],
@@ -486,105 +449,35 @@ export async function syncRealMarketDataFromVNDirect(
       : optionsOrCallback || {};
 
   const mode: SyncScopeMode = opts.mode || 'DELTA_ADJUSTED';
-  // Mỗi batch làm mới lịch sử gồm 18 mã (nằm trong khoảng 15-20 mã/request theo kiến trúc Delta Caching)
-  const invalidationBatchSize = Math.min(20, Math.max(15, opts.batchSize || 18));
-  const timeoutMs = opts.timeoutMs || 4200;
+  // Chia 45 mã/lô -> 1.626 mã chỉ gồm 36-37 lô (nhanh gấp 3 lần so với 97 lô)
+  const batchSize = Math.max(25, opts.batchSize || DEFAULT_SYNC_BATCH_SIZE);
+  const timeoutMs = opts.timeoutMs || 3400;
   const targetExchanges = opts.targetExchanges || ['HOSE', 'HNX', 'UPCOM'];
 
-  // BƯỚC 1: Nạp toàn bộ Cache T-1 từ IndexedDB lên RAM
+  // BƯỚC 1: Reload Data Cache Cũ từ IndexedDB lên RAM
   const { cacheMap } = await hydrateDeltaCacheToRAM(currentStocks);
   const totalUniverse = currentStocks.length;
 
-  // BƯỚC 2: Gọi 1 API duy nhất lấy bảng giá Snapshot T0 (size=2000) của toàn thị trường
-  const { t0Map, t0Date } = await fetchMarketIntradayT0Snapshot(timeoutMs);
-  let lastTradingDate = t0Date || getVietnamTodayDateStr();
+  // BƯỚC 2: Kiểm tra ngày giao dịch mới nhất trên VNDirect (1 request nhẹ kiểm tra VNINDEX)
+  const marketIndex = await checkLatestMarketTradingDateFromVNDirect(2400);
+  if (marketIndex && opts.onMarketIndexUpdate) {
+    opts.onMarketIndexUpdate(marketIndex);
+  }
+  let lastTradingDate = marketIndex?.latestMarketDate || getVietnamDateByTradingOffset(0);
 
-  // Ghép ngay cây nến T0 vào cuối mảng dữ liệu lịch sử T-1 trên RAM
-  let workingStocks = buildStocksFromRamDeltaCache(currentStocks, t0Map);
+  let workingStocks = buildStocksFromRamDeltaCache(currentStocks);
 
   const recentLogs: SyncLogItem[] = [];
   const exchangeDone = { HOSE: 0, HNX: 0, UPCOM: 0 };
   let cacheHitCount = 0;
   let refreshedAdjustedCount = 0;
 
-  // Nếu chỉ yêu cầu cập nhật nhanh T0 trong ngày (khi bấm Filter)
-  if (mode === 'INTRADAY_T0_ONLY' || opts.skipInvalidationCheck) {
-    const nowTime = new Date().toLocaleTimeString('vi-VN', { hour12: false });
-    const cacheUpdates: StockDeltaCacheItem[] = [];
-
-    for (const st of workingStocks) {
-      const q = t0Map.get(st.symbol);
-      const cached = cacheMap.get(st.symbol);
-      exchangeDone[st.exchange]++;
-      if (cached && q) {
-        cached.pendingT0 = {
-          date: q.date,
-          open: q.open,
-          high: q.high,
-          low: q.low,
-          close: q.close,
-          average: q.average,
-          volume: q.volume,
-          basicPrice: q.basicPrice,
-          change: q.change,
-          changePct: q.changePct,
-          totalValueB: q.totalValueB
-        };
-        cacheUpdates.push(cached);
-        cacheHitCount++;
-        if (recentLogs.length < 80) {
-          recentLogs.push({
-            symbol: st.symbol,
-            exchange: st.exchange,
-            oldPrice: cached.lastClose,
-            newPrice: q.close,
-            basicPrice: q.basicPrice,
-            cachedRefPrice: st.exchange === 'UPCOM' ? cached.lastAvgPrice : cached.lastClose,
-            refDiff: Math.abs(
-              q.basicPrice - (st.exchange === 'UPCOM' ? cached.lastAvgPrice : cached.lastClose)
-            ),
-            changePct: q.changePct,
-            totalVolume: q.volume,
-            totalValue: q.totalValueB,
-            barsCount: cached.candles.length + 1,
-            status: 'T0_CACHE_HIT',
-            timestamp: nowTime
-          });
-        }
-      }
-    }
-
-    await saveStockDeltaCachesBatch(cacheUpdates, {
-      lastSyncDate: lastTradingDate,
-      liveHttpCount: t0Map.size,
-      totalStocks: totalUniverse,
-      t0SnapshotCount: t0Map.size,
-      invalidatedRefreshedCount: 0,
-      cacheHitCount
-    });
-
-    const breakdown = getExchangeBreakdown(workingStocks);
-    return {
-      stocks: workingStocks,
-      successCount: workingStocks.length,
-      liveHttpCount: t0Map.size,
-      fallbackCount: Math.max(0, totalUniverse - t0Map.size),
-      t0SnapshotCount: t0Map.size,
-      cacheHitCount,
-      invalidatedRefreshedCount: 0,
-      lastDate: lastTradingDate,
-      breakdown: { HOSE: breakdown.HOSE, HNX: breakdown.HNX, UPCOM: breakdown.UPCOM },
-      logs: recentLogs
-    };
-  }
-
-  // BƯỚC 3: Tự động phát hiện mã điều chỉnh giá (Cache Invalidation) qua đối chiếu basicPrice
-  // Sắp xếp ưu tiên các mã thanh khoản cao trước
   const stockBySymbol = new Map<string, StockData>();
   for (const s of currentStocks) {
     stockBySymbol.set(s.symbol, s);
   }
 
+  // Sắp xếp ưu tiên các mã thanh khoản cao (total_value giảm dần) để các mã trụ/thanh khoản lớn cập nhật ngay từ Lô 1
   const sortedSymbols = [...currentStocks]
     .sort((a, b) => (b.total_value || 0) - (a.total_value || 0))
     .filter((s) => {
@@ -594,173 +487,76 @@ export async function syncRealMarketDataFromVNDirect(
     .slice(0, mode === 'FAST_200' ? 200 : currentStocks.length)
     .map((s) => s.symbol);
 
-  const invalidatedSymbols: string[] = [];
-  const validCacheUpdates: StockDeltaCacheItem[] = [];
+  // BƯỚC 3: Xét duyệt từng mã xem đã có dữ liệu mới nhất chưa hay cần tải tiếp khoảng thời gian còn thiếu
+  const symbolsToDeltaUpdate: string[] = [];
   const nowTime = new Date().toLocaleTimeString('vi-VN', { hour12: false });
 
   for (const sym of sortedSymbols) {
     const stock = stockBySymbol.get(sym)!;
     const cached = cacheMap.get(sym);
-    const t0 = t0Map.get(sym);
 
-    // Nếu sang ngày giao dịch mới (t0.date > pendingT0.date), chốt cây nến pendingT0 của ngày hôm qua vào lịch sử T-1
+    if (!cached || cached.candles.length < 20) {
+      symbolsToDeltaUpdate.push(sym);
+      continue;
+    }
+
+    const effectiveDate = getItemEffectiveDate(cached);
+
+    // Nếu mã đã được đồng bộ thực tế tới ngày giao dịch mới nhất (ví dụ 2026-11-18) và user không bấm ép tải lại:
+    // -> Không cần tải lại, dùng ngay dữ liệu trên RAM!
     if (
-      cached &&
-      t0 &&
-      cached.pendingT0 &&
-      cached.pendingT0.date !== t0.date &&
-      cached.pendingT0.date > cached.lastSyncDate &&
-      !cached.pendingT0.date.startsWith('T-')
+      !cached.isBaselineSeed &&
+      effectiveDate >= lastTradingDate &&
+      !opts.forceManualSync &&
+      mode !== 'INTRADAY_T0_ONLY'
     ) {
-      const p = cached.pendingT0;
-      cached.candles = [
-        ...cached.candles.slice(-249),
-        {
-          date: p.date,
-          open: p.open,
-          high: p.high,
-          low: p.low,
-          close: p.close,
-          average: p.average,
-          volume: p.volume
-        }
-      ];
-      cached.lastClose = p.close;
-      cached.lastAvgPrice = p.average || p.close;
-      cached.lastSyncDate = p.date;
-    }
-
-    const isSeedUnverified = !cached || cached.lastSyncDate === 'SEED_INIT' || cached.candles.length < 30;
-
-    if (t0 && cached && !isSeedUnverified) {
-      // Quy tắc đối chiếu basicPrice:
-      // - Sàn HOSE và HNX: so sánh T0.basicPrice với cache.lastClose
-      // - Sàn UPCOM: so sánh T0.basicPrice với cache.lastAvgPrice
-      const cachedRefPrice =
-        stock.exchange === 'UPCOM' ? cached.lastAvgPrice || cached.lastClose : cached.lastClose;
-      const diff = Math.abs(t0.basicPrice - cachedRefPrice);
-
-      if (diff <= 0.05) {
-        // Không có điều chỉnh giá -> Tái sử dụng 100% lịch sử T-1 từ IndexedDB/RAM, chỉ ghép nến T0!
-        cached.verifiedT0Date = t0.date;
-        cached.pendingT0 = {
-          date: t0.date,
-          open: t0.open,
-          high: t0.high,
-          low: t0.low,
-          close: t0.close,
-          average: t0.average,
-          volume: t0.volume,
-          basicPrice: t0.basicPrice,
-          change: t0.change,
-          changePct: t0.changePct,
-          totalValueB: t0.totalValueB
-        };
-        validCacheUpdates.push(cached);
-        cacheHitCount++;
-        exchangeDone[stock.exchange]++;
-
-        if (recentLogs.length < 60) {
-          recentLogs.push({
-            symbol: sym,
-            exchange: stock.exchange,
-            oldPrice: cached.lastClose,
-            newPrice: t0.close,
-            basicPrice: t0.basicPrice,
-            cachedRefPrice,
-            refDiff: Math.round(diff * 1000) / 1000,
-            changePct: t0.changePct,
-            totalVolume: t0.volume,
-            totalValue: t0.totalValueB,
-            barsCount: cached.candles.length + 1,
-            status: 'T0_CACHE_HIT',
-            timestamp: nowTime
-          });
-        }
-        continue;
-      } else {
-        // Chênh lệch > 0.05 -> Mã có điều chỉnh giá (cổ tức, chia tách) hoặc lệch tham chiếu -> Cần tải lại lịch sử
-        invalidatedSymbols.push(sym);
-        continue;
+      cacheHitCount++;
+      exchangeDone[stock.exchange]++;
+      if (recentLogs.length < 60 && cached.pendingT0) {
+        recentLogs.push({
+          symbol: sym,
+          exchange: stock.exchange,
+          oldPrice: cached.lastClose,
+          newPrice: cached.pendingT0.close,
+          basicPrice: cached.pendingT0.basicPrice ?? cached.lastClose,
+          cachedRefPrice: stock.exchange === 'UPCOM' ? cached.lastAvgPrice : cached.lastClose,
+          refDiff: 0,
+          changePct: cached.pendingT0.changePct ?? 0,
+          totalVolume: cached.pendingT0.volume,
+          totalValue: cached.pendingT0.totalValueB ?? 0,
+          barsCount: cached.candles.length + 1,
+          missingCandlesAdded: 0,
+          fromCacheDate: effectiveDate,
+          toLatestDate: effectiveDate,
+          status: 'T0_CACHE_HIT',
+          timestamp: nowTime
+        });
       }
+      continue;
     }
 
-    // Nếu mã chưa được xác thực lịch sử thực tế trong IndexedDB hoặc lệch tham chiếu -> Đưa vào danh sách cần làm mới
-    if (isSeedUnverified && t0) {
-      const cachedRefPrice =
-        stock.exchange === 'UPCOM'
-          ? cached?.lastAvgPrice || cached?.lastClose || stock.price
-          : cached?.lastClose || stock.price;
-      const diff = Math.abs(t0.basicPrice - cachedRefPrice);
-
-      if (diff > 0.05) {
-        invalidatedSymbols.push(sym);
-      } else if (cached) {
-        // Nếu giá tham chiếu khớp sát (<= 0.05), đánh dấu hợp lệ và ghép nến T0 ngay để tối ưu tốc độ
-        cached.lastSyncDate = t0.date;
-        cached.verifiedT0Date = t0.date;
-        cached.pendingT0 = {
-          date: t0.date,
-          open: t0.open,
-          high: t0.high,
-          low: t0.low,
-          close: t0.close,
-          average: t0.average,
-          volume: t0.volume,
-          basicPrice: t0.basicPrice,
-          change: t0.change,
-          changePct: t0.changePct,
-          totalValueB: t0.totalValueB
-        };
-        validCacheUpdates.push(cached);
-        cacheHitCount++;
-        exchangeDone[stock.exchange]++;
-      }
-    }
+    // Ngược lại: mã đang ở Cache cũ (ví dụ 2026-11-10 hoặc T-1) hoặc cần cập nhật nến T0 mới nhất
+    symbolsToDeltaUpdate.push(sym);
   }
 
-  // Lưu ngay các mã Cache Hit + Snapshot T0 vào RAM & IndexedDB và cập nhật giao diện tức thì
-  if (validCacheUpdates.length > 0) {
-    await saveStockDeltaCachesBatch(validCacheUpdates, {
-      lastSyncDate: lastTradingDate,
-      liveHttpCount: t0Map.size + refreshedAdjustedCount,
-      totalStocks: totalUniverse,
-      t0SnapshotCount: t0Map.size,
-      invalidatedRefreshedCount: refreshedAdjustedCount,
-      cacheHitCount
-    });
-  }
+  // BƯỚC 4: Chạy cập nhật nối tiếp phần thời gian còn thiếu theo 36-37 Lô (45 mã/lô)
+  const totalToProcess = symbolsToDeltaUpdate.length;
+  const totalBatches = Math.max(1, Math.ceil(totalToProcess / batchSize));
+  const toSec = Math.floor(Date.now() / 1000);
+  const fromSec380d = toSec - 380 * 86400;
 
-  workingStocks = buildStocksFromRamDeltaCache(currentStocks, t0Map);
-  if (opts.onIncrementalStocksUpdate) {
-    opts.onIncrementalStocksUpdate(workingStocks, {
-      lastDate: lastTradingDate,
-      liveHttpCount: Math.max(t0Map.size, cacheHitCount),
-      processed: cacheHitCount,
-      totalTarget: sortedSymbols.length,
-      t0SnapshotCount: t0Map.size,
-      cacheHitCount,
-      invalidatedRefreshedCount: 0
-    });
-  }
-
-  // Gom các mã cần làm mới (chênh lệch basicPrice > 0.05 hoặc chưa có cache) thành từng batch 15-20 mã/request
-  const totalInvalidated = invalidatedSymbols.length;
-  const totalBatches = Math.max(1, Math.ceil(totalInvalidated / invalidationBatchSize));
-  const fromDate320d = getPastIsoDateStr(340);
-
-  if (totalInvalidated === 0) {
+  if (totalToProcess === 0) {
     if (opts.onBatchProgress) {
       opts.onBatchProgress({
         processed: sortedSymbols.length,
         totalTarget: sortedSymbols.length,
         totalUniverse,
-        liveUpdatedCount: Math.max(t0Map.size, cacheHitCount),
+        liveUpdatedCount: cacheHitCount,
         fallbackCount: 0,
         cacheHitCount,
         invalidatedCount: 0,
         refreshedAdjustedCount: 0,
-        t0SnapshotCount: t0Map.size,
+        t0SnapshotCount: cacheHitCount,
         batchIndex: 1,
         totalBatches: 1,
         currentBatchSymbols: [],
@@ -768,151 +564,248 @@ export async function syncRealMarketDataFromVNDirect(
         exchangeDone: { ...exchangeDone }
       });
     }
+    if (opts.onIncrementalStocksUpdate) {
+      opts.onIncrementalStocksUpdate(workingStocks, {
+        lastDate: lastTradingDate,
+        liveHttpCount: cacheHitCount,
+        processed: sortedSymbols.length,
+        totalTarget: sortedSymbols.length,
+        t0SnapshotCount: cacheHitCount,
+        cacheHitCount,
+        invalidatedRefreshedCount: 0
+      });
+    }
   } else {
-    for (let b = 0; b < totalInvalidated; b += invalidationBatchSize) {
+    for (let b = 0; b < totalToProcess; b += batchSize) {
       if (opts.shouldAbort && opts.shouldAbort()) {
         break;
       }
 
-      const batchSymbols = invalidatedSymbols.slice(b, b + invalidationBatchSize);
-      const batchIndex = Math.floor(b / invalidationBatchSize) + 1;
-      const batchHistoryMap = await fetchAdjustedHistoryBatchFinfo(
-        batchSymbols,
-        fromDate320d,
-        timeoutMs
-      );
-
+      const batchSymbols = symbolsToDeltaUpdate.slice(b, b + batchSize);
+      const batchIndex = Math.floor(b / batchSize) + 1;
       const batchCacheToSave: StockDeltaCacheItem[] = [];
       const batchTime = new Date().toLocaleTimeString('vi-VN', { hour12: false });
 
-      for (const sym of batchSymbols) {
-        const stock = stockBySymbol.get(sym)!;
-        const prevCache = cacheMap.get(sym);
-        const t0 = t0Map.get(sym);
-        const fetchedCandles = batchHistoryMap.get(sym);
+      await Promise.all(
+        batchSymbols.map(async (sym) => {
+          const stock = stockBySymbol.get(sym)!;
+          const prevCache = cacheMap.get(sym);
 
-        const oldRef =
-          stock.exchange === 'UPCOM'
-            ? prevCache?.lastAvgPrice || prevCache?.lastClose || stock.price
-            : prevCache?.lastClose || stock.price;
+          // Nếu mã chưa có đủ 20 phiên lịch sử trong cache -> Tải 380 ngày
+          if (!prevCache || prevCache.candles.length < 20) {
+            const fullCandles = await fetchVNDirectDChartCandles(
+              sym,
+              fromSec380d,
+              toSec,
+              timeoutMs,
+              20
+            );
+            if (fullCandles && fullCandles.length >= 20) {
+              const { item: newItem, latestDate } = buildDeltaCacheItemFromCandles(
+                sym,
+                stock.exchange,
+                fullCandles
+              );
+              if (latestDate > lastTradingDate) {
+                lastTradingDate = latestDate;
+              }
+              batchCacheToSave.push(newItem);
+              refreshedAdjustedCount++;
+              exchangeDone[stock.exchange]++;
+            } else {
+              exchangeDone[stock.exchange]++;
+            }
+            return;
+          }
 
-        if (fetchedCandles && fetchedCandles.length >= 20) {
-          // Tách lịch sử đã chốt T-1 (những phiên < t0Date) khoảng 200-250 phiên
-          const t1Candles = t0
-            ? fetchedCandles.filter((c) => c.date < t0.date).slice(-250)
-            : fetchedCandles.slice(0, -1).slice(-250);
+          // Mấu chốt Vấn đề 1:
+          // Mã ĐÃ CÓ lịch sử Cache cũ tới ngày `anchorDate` (ví dụ 2026-11-10 hoặc ngày lần trước user mở app).
+          // Ta CHỈ tải phần thời gian còn thiếu từ `anchorDate - 4 ngày` đến `hôm nay` (~5-8 phiên), KHÔNG tải lại 260 phiên!
+          const anchorDate = prevCache.lastSyncDate || EMBEDDED_BASELINE_DATE;
+          const anchorSec = dateStrToUnixSec(anchorDate);
+          const deltaFromSec = Math.max(fromSec380d, Math.min(toSec - 7 * 86400, anchorSec - 4 * 86400));
 
-          const effectiveT1 =
-            t1Candles.length >= 15 ? t1Candles : fetchedCandles.slice(-250);
-          const lastT1 = effectiveT1[effectiveT1.length - 1];
+          const missingCandles = await fetchVNDirectDChartCandles(
+            sym,
+            deltaFromSec,
+            toSec,
+            timeoutMs,
+            1
+          );
 
-          // Lưu tham chiếu T-1 chuẩn xác để các lần sync tiếp theo trong ngày khớp <= 0.05
-          const newLastClose = t0 && stock.exchange !== 'UPCOM' ? t0.basicPrice || lastT1.close : lastT1.close;
-          const newLastAvg = t0 && stock.exchange === 'UPCOM' ? t0.basicPrice || lastT1.average : lastT1.average;
+          if (!missingCandles || missingCandles.length === 0) {
+            exchangeDone[stock.exchange]++;
+            return;
+          }
 
-          const latestCandle = fetchedCandles[fetchedCandles.length - 1];
-          const newItem: StockDeltaCacheItem = {
-            symbol: sym,
-            exchange: stock.exchange,
-            lastSyncDate: lastT1.date || lastTradingDate,
-            lastClose: newLastClose,
-            lastAvgPrice: newLastAvg,
-            candles: effectiveT1,
-            verifiedT0Date: lastTradingDate,
-            pendingT0: t0
-              ? {
-                  date: t0.date,
-                  open: t0.open,
-                  high: t0.high,
-                  low: t0.low,
-                  close: t0.close,
-                  average: t0.average,
-                  volume: t0.volume,
-                  basicPrice: t0.basicPrice,
-                  change: t0.change,
-                  changePct: t0.changePct,
-                  totalValueB: t0.totalValueB
-                }
-              : {
-                  date: latestCandle.date,
-                  open: latestCandle.open,
-                  high: latestCandle.high,
-                  low: latestCandle.low,
-                  close: latestCandle.close,
-                  average: latestCandle.average,
-                  volume: latestCandle.volume,
-                  basicPrice: lastT1.close
-                }
-          };
+          // Kiểm tra điều chỉnh giá tại điểm nối (anchorDate):
+          // Tìm cây nến trùng ngày anchorDate (hoặc gần nhất <= anchorDate) trong chuỗi nến mới tải về
+          let junctionCandle: DeltaHistoricalCandle | undefined;
+          for (const c of missingCandles) {
+            if (c.date <= anchorDate) {
+              junctionCandle = c;
+            } else {
+              break;
+            }
+          }
 
-          batchCacheToSave.push(newItem);
-          refreshedAdjustedCount++;
-          exchangeDone[stock.exchange]++;
+          const cachedAnchorRef =
+            stock.exchange === 'UPCOM'
+              ? prevCache.lastAvgPrice || prevCache.lastClose
+              : prevCache.lastClose;
+          const vndAnchorRef = junctionCandle
+            ? stock.exchange === 'UPCOM'
+              ? junctionCandle.average || junctionCandle.close
+              : junctionCandle.close
+            : cachedAnchorRef;
 
-          const displayNewPrice = t0 ? t0.close : latestCandle.close;
-          const displayChangePct = t0
-            ? t0.changePct
-            : lastT1.close > 0
-            ? Math.round(((latestCandle.close - lastT1.close) / lastT1.close) * 10000) / 100
-            : 0;
+          const junctionDiff = Math.abs(vndAnchorRef - cachedAnchorRef);
 
-          recentLogs.unshift({
-            symbol: sym,
-            exchange: stock.exchange,
-            oldPrice: oldRef,
-            newPrice: displayNewPrice,
-            basicPrice: t0?.basicPrice ?? lastT1.close,
-            cachedRefPrice: oldRef,
-            refDiff: t0 ? Math.round(Math.abs(t0.basicPrice - oldRef) * 100) / 100 : 0,
-            changePct: displayChangePct,
-            totalVolume: t0 ? t0.volume : latestCandle.volume,
-            totalValue: t0
-              ? t0.totalValueB
-              : Math.round(((latestCandle.volume * latestCandle.close * 1000) / 1e9) * 10) / 10,
-            barsCount: effectiveT1.length + 1,
-            status: 'ADJUSTED_REFRESH',
-            timestamp: batchTime
-          });
-        } else {
-          exchangeDone[stock.exchange]++;
-        }
-      }
+          // Nếu tại ngày điểm nối (anchorDate), giá của VNDirect lệch <= 0.05 so với Cache cũ:
+          // -> KHÔNG có sự kiện chia cổ tức/tách cổ phiếu!
+          // -> Chỉ cần nối (append) những cây nến của các ngày còn thiếu vào cuối mảng Cache cũ!
+          if (junctionDiff <= 0.05) {
+            const candleMap = new Map<string, DeltaHistoricalCandle>();
+            for (const c of prevCache.candles) {
+              candleMap.set(c.date, c);
+            }
+            let addedCount = 0;
+            for (const c of missingCandles) {
+              if (!candleMap.has(c.date)) {
+                addedCount++;
+              }
+              candleMap.set(c.date, c);
+            }
+
+            const mergedCandles = Array.from(candleMap.values()).sort((a, b) =>
+              a.date.localeCompare(b.date)
+            );
+            const { item: updatedItem, latestDate } = buildDeltaCacheItemFromCandles(
+              sym,
+              stock.exchange,
+              mergedCandles
+            );
+
+            if (latestDate > lastTradingDate) {
+              lastTradingDate = latestDate;
+            }
+
+            batchCacheToSave.push(updatedItem);
+            cacheHitCount++;
+            exchangeDone[stock.exchange]++;
+
+            const pT0 = updatedItem.pendingT0!;
+            recentLogs.unshift({
+              symbol: sym,
+              exchange: stock.exchange,
+              oldPrice: prevCache.lastClose,
+              newPrice: pT0.close,
+              basicPrice: pT0.basicPrice ?? updatedItem.lastClose,
+              cachedRefPrice: cachedAnchorRef,
+              refDiff: Math.round(junctionDiff * 1000) / 1000,
+              changePct: pT0.changePct ?? 0,
+              totalVolume: pT0.volume,
+              totalValue: pT0.totalValueB ?? 0,
+              barsCount: updatedItem.candles.length + 1,
+              missingCandlesAdded: addedCount,
+              fromCacheDate: anchorDate,
+              toLatestDate: latestDate,
+              status: 'T0_CACHE_HIT',
+              timestamp: batchTime
+            });
+            return;
+          }
+
+          // Nếu chênh lệch > 0.05 tại điểm nối -> Mã có điều chỉnh giá (chia cổ tức/tách CP) trong khoảng thời gian nghỉ:
+          // -> Tự động tải lại full 250 phiên lịch sử đã điều chỉnh cho riêng mã này!
+          const fullAdjustedCandles = await fetchVNDirectDChartCandles(
+            sym,
+            fromSec380d,
+            toSec,
+            timeoutMs,
+            20
+          );
+
+          if (fullAdjustedCandles && fullAdjustedCandles.length >= 20) {
+            const { item: newItem, latestDate } = buildDeltaCacheItemFromCandles(
+              sym,
+              stock.exchange,
+              fullAdjustedCandles
+            );
+            if (latestDate > lastTradingDate) {
+              lastTradingDate = latestDate;
+            }
+
+            batchCacheToSave.push(newItem);
+            refreshedAdjustedCount++;
+            exchangeDone[stock.exchange]++;
+
+            const pT0 = newItem.pendingT0!;
+            recentLogs.unshift({
+              symbol: sym,
+              exchange: stock.exchange,
+              oldPrice: cachedAnchorRef,
+              newPrice: pT0.close,
+              basicPrice: pT0.basicPrice ?? newItem.lastClose,
+              cachedRefPrice: cachedAnchorRef,
+              refDiff: Math.round(junctionDiff * 100) / 100,
+              changePct: pT0.changePct ?? 0,
+              totalVolume: pT0.volume,
+              totalValue: pT0.totalValueB ?? 0,
+              barsCount: newItem.candles.length + 1,
+              missingCandlesAdded: fullAdjustedCandles.length,
+              fromCacheDate: anchorDate,
+              toLatestDate: latestDate,
+              status: 'ADJUSTED_REFRESH',
+              timestamp: batchTime
+            });
+          } else {
+            exchangeDone[stock.exchange]++;
+          }
+        })
+      );
 
       if (recentLogs.length > 120) {
         recentLogs.length = 120;
       }
 
-      const processedInvalidated = Math.min(totalInvalidated, b + batchSymbols.length);
-      const totalProcessed = cacheHitCount + processedInvalidated;
+      const processedInLoop = Math.min(totalToProcess, b + batchSymbols.length);
+      const totalSyncedSoFar = cacheHitCount + refreshedAdjustedCount;
+      const progressProcessed = Math.max(
+        totalSyncedSoFar,
+        sortedSymbols.length - totalToProcess + processedInLoop
+      );
 
-      // Ghi đè các mã vừa tải lại full lịch sử điều chỉnh vào RAM + IndexedDB
       if (batchCacheToSave.length > 0) {
+        setKnownLatestMarketDate(lastTradingDate);
         await saveStockDeltaCachesBatch(batchCacheToSave, {
           lastSyncDate: lastTradingDate,
-          liveHttpCount: Math.max(t0Map.size, cacheHitCount + refreshedAdjustedCount),
+          liveHttpCount: totalSyncedSoFar,
           totalStocks: totalUniverse,
-          t0SnapshotCount: t0Map.size,
+          t0SnapshotCount: totalSyncedSoFar,
           invalidatedRefreshedCount: refreshedAdjustedCount,
-          cacheHitCount
+          cacheHitCount,
+          latestMarketDate: lastTradingDate
         });
       }
 
-      workingStocks = buildStocksFromRamDeltaCache(currentStocks, t0Map);
+      // Tạo mảng StockData[] mới nhất từ RAM để bộ lọc Filter lọc ngay trên dữ liệu mới nhất (sửa Vấn đề 2)
+      workingStocks = buildStocksFromRamDeltaCache(currentStocks);
 
       if (opts.onProgress) {
-        opts.onProgress(totalProcessed, sortedSymbols.length);
+        opts.onProgress(progressProcessed, sortedSymbols.length);
       }
       if (opts.onBatchProgress) {
         opts.onBatchProgress({
-          processed: totalProcessed,
+          processed: progressProcessed,
           totalTarget: sortedSymbols.length,
           totalUniverse,
-          liveUpdatedCount: Math.max(t0Map.size, cacheHitCount + refreshedAdjustedCount),
-          fallbackCount: Math.max(0, totalProcessed - (cacheHitCount + refreshedAdjustedCount)),
+          liveUpdatedCount: totalSyncedSoFar,
+          fallbackCount: Math.max(0, progressProcessed - totalSyncedSoFar),
           cacheHitCount,
-          invalidatedCount: totalInvalidated,
+          invalidatedCount: refreshedAdjustedCount,
           refreshedAdjustedCount,
-          t0SnapshotCount: t0Map.size,
+          t0SnapshotCount: totalSyncedSoFar,
           batchIndex,
           totalBatches,
           currentBatchSymbols: batchSymbols,
@@ -921,16 +814,14 @@ export async function syncRealMarketDataFromVNDirect(
         });
       }
 
-      if (
-        opts.onIncrementalStocksUpdate &&
-        (batchIndex === 1 || batchIndex % 2 === 0 || processedInvalidated === totalInvalidated)
-      ) {
+      // Cập nhật trực tiếp bảng kết quả lọc sau mỗi lô để bộ lọc luôn chạy trên dữ liệu mới nhất
+      if (opts.onIncrementalStocksUpdate && batchCacheToSave.length > 0) {
         opts.onIncrementalStocksUpdate(workingStocks, {
           lastDate: lastTradingDate,
-          liveHttpCount: Math.max(t0Map.size, cacheHitCount + refreshedAdjustedCount),
-          processed: totalProcessed,
+          liveHttpCount: totalSyncedSoFar,
+          processed: progressProcessed,
           totalTarget: sortedSymbols.length,
-          t0SnapshotCount: t0Map.size,
+          t0SnapshotCount: totalSyncedSoFar,
           cacheHitCount,
           invalidatedRefreshedCount: refreshedAdjustedCount
         });
@@ -939,14 +830,14 @@ export async function syncRealMarketDataFromVNDirect(
   }
 
   const breakdown = getExchangeBreakdown(workingStocks);
-  const totalLive = Math.max(t0Map.size, cacheHitCount + refreshedAdjustedCount);
+  const totalLive = cacheHitCount + refreshedAdjustedCount;
 
   return {
     stocks: workingStocks,
     successCount: workingStocks.length,
     liveHttpCount: totalLive,
     fallbackCount: Math.max(0, totalUniverse - totalLive),
-    t0SnapshotCount: t0Map.size,
+    t0SnapshotCount: totalLive,
     cacheHitCount,
     invalidatedRefreshedCount: refreshedAdjustedCount,
     lastDate: lastTradingDate,
@@ -958,3 +849,5 @@ export async function syncRealMarketDataFromVNDirect(
     logs: recentLogs
   };
 }
+
+export { inspectDeltaCacheFreshness };

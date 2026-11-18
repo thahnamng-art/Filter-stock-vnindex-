@@ -451,6 +451,9 @@ async function fetchOhlcvWindowFromVNDirect(
 
   const candidateUrls = [
     directUrl,
+    `${directUrl}&_r=1`,
+    `${directUrl}&_r=2`,
+    `${directUrl}&_r=3`,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`
   ];
 
@@ -462,17 +465,19 @@ async function fetchOhlcvWindowFromVNDirect(
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
       if (!res.ok) continue;
-      const data = await res.json();
+      const text = (await res.text()).trim();
+      if (!text.startsWith('{')) continue;
+      const data = JSON.parse(text);
       if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= 5) {
         const len = data.c.length;
         const candles: OhlcvCandle[] = [];
 
         for (let i = 0; i < len; i++) {
           const ts = data.t[i];
-          const dt = new Date(ts * 1000);
-          const yyyy = dt.getFullYear();
-          const mm = String(dt.getMonth() + 1).padStart(2, '0');
-          const dd = String(dt.getDate()).padStart(2, '0');
+          const dt = new Date((ts + 7 * 3600) * 1000);
+          const yyyy = dt.getUTCFullYear();
+          const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+          const dd = String(dt.getUTCDate()).padStart(2, '0');
 
           candles.push({
             timestamp: ts,
