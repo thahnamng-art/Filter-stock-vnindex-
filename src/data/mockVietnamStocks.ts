@@ -1,7 +1,6 @@
 import {
   StockData,
   ExchangeType,
-  getVietnamTodayDateStr,
   getVietnamDateByTradingOffset
 } from '../types/screener';
 import REAL_STOCKS_DATA from './realMarketData.json';
@@ -10,13 +9,17 @@ import {
   DeltaHistoricalCandle,
   StockDeltaCacheItem,
   IntradayT0Quote,
+  DeltaCacheFreshnessReport,
+  DeltaSyncUpdateReason,
   hydrateDeltaCacheToRAM,
   saveStockDeltaCachesBatch,
   buildStocksFromRamDeltaCache,
   inspectDeltaCacheFreshness,
   getItemEffectiveDate,
   dateStrToUnixSec,
-  setKnownLatestMarketDate
+  setKnownLatestMarketDate,
+  setKnownLiveMarketProbe,
+  getVietnamSessionClockInfo
 } from '../services/marketCacheStorage';
 
 interface RawStockItem {
@@ -60,7 +63,7 @@ export interface SyncLogItem {
   missingCandlesAdded?: number;
   fromCacheDate?: string;
   toLatestDate?: string;
-  status: 'T0_CACHE_HIT' | 'ADJUSTED_REFRESH' | 'LIVE_HTTP' | 'EMBEDDED_REAL';
+  status: 'T0_CACHE_HIT' | 'INTRADAY_T0_REFRESH' | 'EOD_FINAL_LOCK' | 'ADJUSTED_REFRESH' | 'LIVE_HTTP';
   timestamp: string;
 }
 
@@ -79,16 +82,19 @@ export interface SyncBatchProgress {
   currentBatchSymbols: string[];
   recentLogs: SyncLogItem[];
   exchangeDone: { HOSE: number; HNX: number; UPCOM: number };
+  updateReason?: DeltaSyncUpdateReason;
+  updateReasonText?: string;
 }
 
 export interface MarketIndexLiveStatus {
   latestMarketDate: string;
   vnIndexClose: number;
+  vnIndexVolume: number;
   vnIndexChange: number;
   vnIndexChangePct: number;
 }
 
-// Mặc định 45 mã/lô -> 1.626 mã chia thành đúng 36-37 lô cực nhanh (như bản 36 lô)
+// Mặc định 45 mã/lô -> 1.626 mã chia thành đúng 36-37 lô tốc độ cao
 export const DEFAULT_SYNC_BATCH_SIZE = 45;
 
 function expandTo260Bars(recentCloses: number[], price52wAgo?: number): number[] {
@@ -222,9 +228,11 @@ async function fetchJsonDirectWithRetry(
 }
 
 /**
- * BƯỚC 2 (Khi mở app hoặc bấm Filter):
- * Chạy 1 request cực nhẹ (< 100ms) kiểm tra chỉ số VNINDEX trên VNDirect để biết chính xác
- * có phiên giao dịch mới hơn dữ liệu đang lưu trong Cache hay không.
+ * BƯỚC 2 (Khi mở app, bấm Filter hoặc kiểm tra định kỳ trong phiên):
+ * Chạy 1 request cực nhẹ (< 100ms) kiểm tra chỉ số VNINDEX trên VNDirect để lấy cả 3 thông số:
+ * - Ngày giao dịch mới nhất (latestMarketDate)
+ * - Giá Close thực tế hiện tại của VNINDEX (vnIndexClose)
+ * - Tổng Khối lượng hiện tại của VNINDEX (vnIndexVolume)
  */
 export async function checkLatestMarketTradingDateFromVNDirect(
   timeoutMs = 2400
@@ -243,26 +251,28 @@ export async function checkLatestMarketTradingDateFromVNDirect(
   if (lastTs <= 0) return null;
 
   const latestMarketDate = new Date((lastTs + 7 * 3600) * 1000).toISOString().slice(0, 10);
-  setKnownLatestMarketDate(latestMarketDate);
-
   const lastClose = Math.round(Number(data.c?.[len - 1] || 1743.07) * 100) / 100;
+  const lastVolume = Math.max(0, Math.round(Number(data.v?.[len - 1] || 0)));
   const prevClose =
     len >= 2 ? Math.round(Number(data.c?.[len - 2] || lastClose) * 100) / 100 : lastClose;
   const vnIndexChange = Math.round((lastClose - prevClose) * 100) / 100;
   const vnIndexChangePct =
     prevClose > 0 ? Math.round(((lastClose - prevClose) / prevClose) * 10000) / 100 : 0;
 
-  return {
+  const probe: MarketIndexLiveStatus = {
     latestMarketDate,
     vnIndexClose: lastClose,
+    vnIndexVolume: lastVolume,
     vnIndexChange,
     vnIndexChangePct
   };
+
+  setKnownLiveMarketProbe(probe);
+  return probe;
 }
 
 /**
  * Lấy chuỗi nến từ dchart-api.vndirect.com.vn/dchart/history theo khoảng thời gian [fromSec, toSec]
- * (Chỉ lấy đúng khoảng thời gian còn thiếu từ lastSyncDate -> hôm nay, hoặc 380 ngày nếu mã có điều chỉnh giá).
  */
 async function fetchVNDirectDChartCandles(
   symbol: string,
@@ -309,7 +319,9 @@ async function fetchVNDirectDChartCandles(
 }
 
 /**
- * Chuẩn hóa bản ghi StockDeltaCacheItem từ danh sách nến lịch sử đầy đủ (tách T-1 và T0)
+ * Chuẩn hóa bản ghi StockDeltaCacheItem từ danh sách nến lịch sử đầy đủ:
+ * - Tách lịch sử quá khứ đã chốt (<= T-1) lưu cố định trong `candles`
+ * - Tách cây nến phiên hiện tại (T0) lưu trong `pendingT0` để sẵn sàng cập nhật realtime trong phiên
  */
 function buildDeltaCacheItemFromCandles(
   symbol: string,
@@ -384,10 +396,10 @@ function buildDeltaCacheItemFromCandles(
 }
 
 /**
- * Kiểm tra nhanh xem trên VNDirect có dữ liệu mới hơn Cache hiện tại không khi user bấm Filter:
+ * Kiểm định 3 chiều xem trên VNDirect có dữ liệu mới hơn Cache hiện tại không:
  * - Bước 1: Nạp Cache từ IndexedDB/RAM
- * - Bước 2: Gọi 1 request nhẹ kiểm tra ngày giao dịch mới nhất của thị trường (VNINDEX)
- * - Bước 3: Xét duyệt xem Cache đã ở ngày mới nhất chưa hay cần chạy cập nhật bù những ngày còn thiếu
+ * - Bước 2: Gọi 1 request nhẹ kiểm tra VNINDEX lấy { Ngày, Giá Close, Volume }
+ * - Bước 3: Đối chiếu Ngày + Giá Close & Volume VNINDEX + Số phút trôi qua trong phiên (1-3 phút) + Kiểm tra chốt giá cuối ngày buổi tối
  */
 export async function checkAndDecideMarketDeltaSync(
   currentStocks: StockData[]
@@ -397,12 +409,13 @@ export async function checkAndDecideMarketDeltaSync(
   latestCachedDate: string;
   missingDaysEstimate: number;
   needsUpdate: boolean;
+  freshness: DeltaCacheFreshnessReport;
   marketIndex: MarketIndexLiveStatus | null;
 }> {
   await hydrateDeltaCacheToRAM(currentStocks);
   const marketIndex = await checkLatestMarketTradingDateFromVNDirect(2400);
   const targetMarketDate = marketIndex?.latestMarketDate || getVietnamDateByTradingOffset(0);
-  const freshness = inspectDeltaCacheFreshness(currentStocks.length, targetMarketDate);
+  const freshness = inspectDeltaCacheFreshness(currentStocks.length, targetMarketDate, marketIndex);
   const stocksFromRam = buildStocksFromRamDeltaCache(currentStocks);
 
   return {
@@ -411,22 +424,19 @@ export async function checkAndDecideMarketDeltaSync(
     latestCachedDate: freshness.latestCachedDate,
     missingDaysEstimate: freshness.missingDaysEstimate,
     needsUpdate: freshness.needsUpdate,
+    freshness,
     marketIndex
   };
 }
 
 /**
- * Luồng Đồng Bộ Delta Caching Tối Ưu Tốc Độ (36 Lô - Chỉ tải tiếp khoảng thời gian còn thiếu):
- * 1. Reload Data Cache Cũ từ IndexedDB lên RAM (các mã đã có ~210-250 phiên lịch sử tới lastSyncDate, ví dụ 10/11/2026).
- * 2. Chạy kiểm tra có Data mới trên VNDirect không (qua 1 request VNINDEX < 100ms lấy latestMarketDate, ví dụ 18/11/2026).
- * 3. Xét duyệt:
- *    - Nếu mã đã có dữ liệu tới latestMarketDate (18/11/2026) và không ép cập nhật lại: Bỏ qua ngay (Cache Hit 0ms)!
- *    - Nếu mã còn thiếu dữ liệu từ `lastSyncDate` đến `latestMarketDate`:
- *      + Chỉ gọi lấy đúng **khoảng thời gian còn thiếu** (`from = lastSyncDate - 3 ngày` đến `now`, ví dụ chỉ ~6-7 cây nến từ 10/11 -> 18/11 thay vì 260 cây nến!).
- *      + Tại điểm nối `lastSyncDate`, đối chiếu giá trên VNDirect với `cache.lastClose` (HOSE/HNX) hoặc `cache.lastAvgPrice` (UPCOM):
- *        * Nếu chênh lệch `<= 0.05`: Không có điều chỉnh giá -> Nối (append) ngay các cây nến còn thiếu vào cuối mảng Cache trên RAM + IndexedDB!
- *        * Nếu chênh lệch `> 0.05`: Mã có chia cổ tức / tách cổ phiếu -> Tự động tải lại full 250 phiên lịch sử đã điều chỉnh cho riêng mã đó!
- *    - Chia 1.626 mã thành **36 lô (45 mã/lô)** chạy song song cực nhanh và cập nhật trực tiếp vào bộ lọc Filter sau mỗi lô!
+ * Luồng Đồng Bộ Delta Caching Kết Hợp Realtime Intraday T0 (36 Lô - 45 mã/lô):
+ * - Quá khứ (<= T-1): Đã có trong IndexedDB thì khóa cố định, không bao giờ tải lại (trừ khi mã có chia tách cổ tức |Δ| > 0.05).
+ * - Ngày thiếu: Chỉ tải đúng khoảng thời gian còn thiếu (from = lastSyncDate -> now).
+ * - Cùng ngày hôm nay (T0):
+ *   + Nếu phát hiện Giá Close hoặc Volume của VNINDEX thay đổi, hoặc đã qua >= 2 phút trong giờ giao dịch (09:00-15:05),
+ *     hoặc mở app buổi tối cần chốt lại giá đóng cửa cuối ngày sau phiên ATC:
+ *     Hệ thống làm mới cây nến T0 cho các mã trong 36 lô (chỉ lấy cửa sổ nến ngắn hạn ~3-5 ngày quanh T-1 & T0).
  */
 export async function syncRealMarketDataFromVNDirect(
   currentStocks: StockData[],
@@ -440,6 +450,8 @@ export async function syncRealMarketDataFromVNDirect(
   cacheHitCount: number;
   invalidatedRefreshedCount: number;
   lastDate: string;
+  updateReason: DeltaSyncUpdateReason;
+  updateReasonText: string;
   breakdown: { HOSE: number; HNX: number; UPCOM: number };
   logs: SyncLogItem[];
 }> {
@@ -449,7 +461,6 @@ export async function syncRealMarketDataFromVNDirect(
       : optionsOrCallback || {};
 
   const mode: SyncScopeMode = opts.mode || 'DELTA_ADJUSTED';
-  // Chia 45 mã/lô -> 1.626 mã chỉ gồm 36-37 lô (nhanh gấp 3 lần so với 97 lô)
   const batchSize = Math.max(25, opts.batchSize || DEFAULT_SYNC_BATCH_SIZE);
   const timeoutMs = opts.timeoutMs || 3400;
   const targetExchanges = opts.targetExchanges || ['HOSE', 'HNX', 'UPCOM'];
@@ -458,12 +469,16 @@ export async function syncRealMarketDataFromVNDirect(
   const { cacheMap } = await hydrateDeltaCacheToRAM(currentStocks);
   const totalUniverse = currentStocks.length;
 
-  // BƯỚC 2: Kiểm tra ngày giao dịch mới nhất trên VNDirect (1 request nhẹ kiểm tra VNINDEX)
+  // BƯỚC 2: Gọi 1 request kiểm tra VNINDEX để đối chiếu Ngày + Giá Close + Volume
   const marketIndex = await checkLatestMarketTradingDateFromVNDirect(2400);
   if (marketIndex && opts.onMarketIndexUpdate) {
     opts.onMarketIndexUpdate(marketIndex);
   }
   let lastTradingDate = marketIndex?.latestMarketDate || getVietnamDateByTradingOffset(0);
+
+  // Kiểm định 3 chiều (Ngày + Giá Close/Volume VNINDEX + Số phút trong phiên + Chốt giá buổi tối)
+  const freshness = inspectDeltaCacheFreshness(totalUniverse, lastTradingDate, marketIndex);
+  const clock = getVietnamSessionClockInfo();
 
   let workingStocks = buildStocksFromRamDeltaCache(currentStocks);
 
@@ -487,59 +502,62 @@ export async function syncRealMarketDataFromVNDirect(
     .slice(0, mode === 'FAST_200' ? 200 : currentStocks.length)
     .map((s) => s.symbol);
 
-  // BƯỚC 3: Xét duyệt từng mã xem đã có dữ liệu mới nhất chưa hay cần tải tiếp khoảng thời gian còn thiếu
+  // BƯỚC 3: Xét duyệt từng mã dựa trên kết quả kiểm định 3 chiều
   const symbolsToDeltaUpdate: string[] = [];
   const nowTime = new Date().toLocaleTimeString('vi-VN', { hour12: false });
+
+  // Nếu freshness.needsUpdate === true (do nhảy giá Close/Vol trong phiên, hoặc quá 2 phút trong phiên, hoặc kiểm tra chốt giá buổi tối)
+  // thì toàn bộ các mã mục tiêu cần được làm mới nến T0!
+  const requireGlobalT0Refresh =
+    opts.forceManualSync ||
+    mode === 'INTRADAY_T0_ONLY' ||
+    freshness.updateReason === 'INTRADAY_PRICE_VOL_CHANGE' ||
+    freshness.updateReason === 'INTRADAY_TIME_ELAPSED' ||
+    freshness.updateReason === 'EOD_FINAL_CLOSE_CHECK';
 
   for (const sym of sortedSymbols) {
     const stock = stockBySymbol.get(sym)!;
     const cached = cacheMap.get(sym);
 
-    if (!cached || cached.candles.length < 20) {
+    if (!cached || cached.candles.length < 20 || cached.isBaselineSeed) {
       symbolsToDeltaUpdate.push(sym);
       continue;
     }
 
     const effectiveDate = getItemEffectiveDate(cached);
 
-    // Nếu mã đã được đồng bộ thực tế tới ngày giao dịch mới nhất (ví dụ 2026-11-18) và user không bấm ép tải lại:
-    // -> Không cần tải lại, dùng ngay dữ liệu trên RAM!
-    if (
-      !cached.isBaselineSeed &&
-      effectiveDate >= lastTradingDate &&
-      !opts.forceManualSync &&
-      mode !== 'INTRADAY_T0_ONLY'
-    ) {
-      cacheHitCount++;
-      exchangeDone[stock.exchange]++;
-      if (recentLogs.length < 60 && cached.pendingT0) {
-        recentLogs.push({
-          symbol: sym,
-          exchange: stock.exchange,
-          oldPrice: cached.lastClose,
-          newPrice: cached.pendingT0.close,
-          basicPrice: cached.pendingT0.basicPrice ?? cached.lastClose,
-          cachedRefPrice: stock.exchange === 'UPCOM' ? cached.lastAvgPrice : cached.lastClose,
-          refDiff: 0,
-          changePct: cached.pendingT0.changePct ?? 0,
-          totalVolume: cached.pendingT0.volume,
-          totalValue: cached.pendingT0.totalValueB ?? 0,
-          barsCount: cached.candles.length + 1,
-          missingCandlesAdded: 0,
-          fromCacheDate: effectiveDate,
-          toLatestDate: effectiveDate,
-          status: 'T0_CACHE_HIT',
-          timestamp: nowTime
-        });
-      }
+    // Nếu mã thiếu ngày (effectiveDate < lastTradingDate) HOẶC thị trường có biến động nến T0 mới cần làm mới:
+    if (effectiveDate < lastTradingDate || requireGlobalT0Refresh) {
+      symbolsToDeltaUpdate.push(sym);
       continue;
     }
 
-    // Ngược lại: mã đang ở Cache cũ (ví dụ 2026-11-10 hoặc T-1) hoặc cần cập nhật nến T0 mới nhất
-    symbolsToDeltaUpdate.push(sym);
+    // Chỉ khi cùng ngày, Giá Close & Volume VNINDEX không đổi, và đã chốt cuối ngày (hoặc vừa cập nhật < 2 phút trước):
+    cacheHitCount++;
+    exchangeDone[stock.exchange]++;
+    if (recentLogs.length < 60 && cached.pendingT0) {
+      recentLogs.push({
+        symbol: sym,
+        exchange: stock.exchange,
+        oldPrice: cached.lastClose,
+        newPrice: cached.pendingT0.close,
+        basicPrice: cached.pendingT0.basicPrice ?? cached.lastClose,
+        cachedRefPrice: stock.exchange === 'UPCOM' ? cached.lastAvgPrice : cached.lastClose,
+        refDiff: 0,
+        changePct: cached.pendingT0.changePct ?? 0,
+        totalVolume: cached.pendingT0.volume,
+        totalValue: cached.pendingT0.totalValueB ?? 0,
+        barsCount: cached.candles.length + 1,
+        missingCandlesAdded: 0,
+        fromCacheDate: effectiveDate,
+        toLatestDate: effectiveDate,
+        status: 'T0_CACHE_HIT',
+        timestamp: nowTime
+      });
+    }
   }
 
-  // BƯỚC 4: Chạy cập nhật nối tiếp phần thời gian còn thiếu theo 36-37 Lô (45 mã/lô)
+  // BƯỚC 4: Chạy cập nhật nối tiếp phần ngày còn thiếu / làm mới nến T0 theo 36-37 Lô (45 mã/lô)
   const totalToProcess = symbolsToDeltaUpdate.length;
   const totalBatches = Math.max(1, Math.ceil(totalToProcess / batchSize));
   const toSec = Math.floor(Date.now() / 1000);
@@ -561,7 +579,9 @@ export async function syncRealMarketDataFromVNDirect(
         totalBatches: 1,
         currentBatchSymbols: [],
         recentLogs: [...recentLogs],
-        exchangeDone: { ...exchangeDone }
+        exchangeDone: { ...exchangeDone },
+        updateReason: freshness.updateReason,
+        updateReasonText: freshness.updateReasonText
       });
     }
     if (opts.onIncrementalStocksUpdate) {
@@ -591,7 +611,6 @@ export async function syncRealMarketDataFromVNDirect(
           const stock = stockBySymbol.get(sym)!;
           const prevCache = cacheMap.get(sym);
 
-          // Nếu mã chưa có đủ 20 phiên lịch sử trong cache -> Tải 380 ngày
           if (!prevCache || prevCache.candles.length < 20) {
             const fullCandles = await fetchVNDirectDChartCandles(
               sym,
@@ -618,14 +637,18 @@ export async function syncRealMarketDataFromVNDirect(
             return;
           }
 
-          // Mấu chốt Vấn đề 1:
-          // Mã ĐÃ CÓ lịch sử Cache cũ tới ngày `anchorDate` (ví dụ 2026-11-10 hoặc ngày lần trước user mở app).
-          // Ta CHỈ tải phần thời gian còn thiếu từ `anchorDate - 4 ngày` đến `hôm nay` (~5-8 phiên), KHÔNG tải lại 260 phiên!
+          // Dữ liệu quá khứ (<= T-1) đã chốt tới anchorDate (lastSyncDate).
+          // Ta chỉ lấy cửa sổ ngắn từ anchorDate - 4 ngày đến thời điểm hiện tại để:
+          // 1) Kiểm tra giá tại điểm nối anchorDate (T-1) xem có điều chỉnh giá không
+          // 2) Nối thêm ngày mới (nếu thiếu ngày) HOẶC cập nhật giá Close & Volume mới nhất của cây nến T0 hôm nay!
           const anchorDate = prevCache.lastSyncDate || EMBEDDED_BASELINE_DATE;
           const anchorSec = dateStrToUnixSec(anchorDate);
-          const deltaFromSec = Math.max(fromSec380d, Math.min(toSec - 7 * 86400, anchorSec - 4 * 86400));
+          const deltaFromSec = Math.max(
+            fromSec380d,
+            Math.min(toSec - 7 * 86400, anchorSec - 4 * 86400)
+          );
 
-          const missingCandles = await fetchVNDirectDChartCandles(
+          const missingOrT0Candles = await fetchVNDirectDChartCandles(
             sym,
             deltaFromSec,
             toSec,
@@ -633,15 +656,13 @@ export async function syncRealMarketDataFromVNDirect(
             1
           );
 
-          if (!missingCandles || missingCandles.length === 0) {
+          if (!missingOrT0Candles || missingOrT0Candles.length === 0) {
             exchangeDone[stock.exchange]++;
             return;
           }
 
-          // Kiểm tra điều chỉnh giá tại điểm nối (anchorDate):
-          // Tìm cây nến trùng ngày anchorDate (hoặc gần nhất <= anchorDate) trong chuỗi nến mới tải về
           let junctionCandle: DeltaHistoricalCandle | undefined;
-          for (const c of missingCandles) {
+          for (const c of missingOrT0Candles) {
             if (c.date <= anchorDate) {
               junctionCandle = c;
             } else {
@@ -660,18 +681,19 @@ export async function syncRealMarketDataFromVNDirect(
             : cachedAnchorRef;
 
           const junctionDiff = Math.abs(vndAnchorRef - cachedAnchorRef);
+          const prevEffectiveDate = getItemEffectiveDate(prevCache);
+          const oldDisplayedPrice = prevCache.pendingT0?.close || prevCache.lastClose;
 
-          // Nếu tại ngày điểm nối (anchorDate), giá của VNDirect lệch <= 0.05 so với Cache cũ:
-          // -> KHÔNG có sự kiện chia cổ tức/tách cổ phiếu!
-          // -> Chỉ cần nối (append) những cây nến của các ngày còn thiếu vào cuối mảng Cache cũ!
+          // Nếu tại ngày điểm nối T-1 (anchorDate), giá của VNDirect lệch <= 0.05 so với Cache cũ:
+          // -> Lịch sử quá khứ <= T-1 hoàn toàn chính xác, giữ nguyên 100%, chỉ nối ngày thiếu & cập nhật nến T0!
           if (junctionDiff <= 0.05) {
             const candleMap = new Map<string, DeltaHistoricalCandle>();
             for (const c of prevCache.candles) {
               candleMap.set(c.date, c);
             }
             let addedCount = 0;
-            for (const c of missingCandles) {
-              if (!candleMap.has(c.date)) {
+            for (const c of missingOrT0Candles) {
+              if (!candleMap.has(c.date) && c.date > prevEffectiveDate) {
                 addedCount++;
               }
               candleMap.set(c.date, c);
@@ -695,10 +717,17 @@ export async function syncRealMarketDataFromVNDirect(
             exchangeDone[stock.exchange]++;
 
             const pT0 = updatedItem.pendingT0!;
+            const logStatus: SyncLogItem['status'] =
+              freshness.updateReason === 'EOD_FINAL_CLOSE_CHECK'
+                ? 'EOD_FINAL_LOCK'
+                : prevEffectiveDate === latestDate && !prevCache.isBaselineSeed
+                ? 'INTRADAY_T0_REFRESH'
+                : 'T0_CACHE_HIT';
+
             recentLogs.unshift({
               symbol: sym,
               exchange: stock.exchange,
-              oldPrice: prevCache.lastClose,
+              oldPrice: oldDisplayedPrice,
               newPrice: pT0.close,
               basicPrice: pT0.basicPrice ?? updatedItem.lastClose,
               cachedRefPrice: cachedAnchorRef,
@@ -708,16 +737,15 @@ export async function syncRealMarketDataFromVNDirect(
               totalValue: pT0.totalValueB ?? 0,
               barsCount: updatedItem.candles.length + 1,
               missingCandlesAdded: addedCount,
-              fromCacheDate: anchorDate,
+              fromCacheDate: prevCache.isBaselineSeed ? anchorDate : prevEffectiveDate,
               toLatestDate: latestDate,
-              status: 'T0_CACHE_HIT',
+              status: logStatus,
               timestamp: batchTime
             });
             return;
           }
 
-          // Nếu chênh lệch > 0.05 tại điểm nối -> Mã có điều chỉnh giá (chia cổ tức/tách CP) trong khoảng thời gian nghỉ:
-          // -> Tự động tải lại full 250 phiên lịch sử đã điều chỉnh cho riêng mã này!
+          // Nếu chênh lệch > 0.05 tại điểm nối -> Mã có điều chỉnh giá (chia cổ tức/tách CP) -> Tải lại 250 phiên lịch sử đã điều chỉnh!
           const fullAdjustedCandles = await fetchVNDirectDChartCandles(
             sym,
             fromSec380d,
@@ -744,7 +772,7 @@ export async function syncRealMarketDataFromVNDirect(
             recentLogs.unshift({
               symbol: sym,
               exchange: stock.exchange,
-              oldPrice: cachedAnchorRef,
+              oldPrice: oldDisplayedPrice,
               newPrice: pT0.close,
               basicPrice: pT0.basicPrice ?? newItem.lastClose,
               cachedRefPrice: cachedAnchorRef,
@@ -775,9 +803,12 @@ export async function syncRealMarketDataFromVNDirect(
         totalSyncedSoFar,
         sortedSymbols.length - totalToProcess + processedInLoop
       );
+      const isLastBatch = processedInLoop >= totalToProcess;
 
       if (batchCacheToSave.length > 0) {
         setKnownLatestMarketDate(lastTradingDate);
+        // Nếu đồng bộ sau 15:05 chiều (buổi tối / sau phiên ATC) và đã hoàn tất lô cuối cùng -> Khóa chốt giá đóng cửa cuối ngày!
+        const shouldLockEod = clock.isAfterMarketClose && isLastBatch;
         await saveStockDeltaCachesBatch(batchCacheToSave, {
           lastSyncDate: lastTradingDate,
           liveHttpCount: totalSyncedSoFar,
@@ -785,11 +816,13 @@ export async function syncRealMarketDataFromVNDirect(
           t0SnapshotCount: totalSyncedSoFar,
           invalidatedRefreshedCount: refreshedAdjustedCount,
           cacheHitCount,
-          latestMarketDate: lastTradingDate
+          latestMarketDate: lastTradingDate,
+          vnIndexClose: marketIndex?.vnIndexClose,
+          vnIndexVolume: marketIndex?.vnIndexVolume,
+          isEndOfDayLocked: shouldLockEod
         });
       }
 
-      // Tạo mảng StockData[] mới nhất từ RAM để bộ lọc Filter lọc ngay trên dữ liệu mới nhất (sửa Vấn đề 2)
       workingStocks = buildStocksFromRamDeltaCache(currentStocks);
 
       if (opts.onProgress) {
@@ -810,11 +843,12 @@ export async function syncRealMarketDataFromVNDirect(
           totalBatches,
           currentBatchSymbols: batchSymbols,
           recentLogs: [...recentLogs],
-          exchangeDone: { ...exchangeDone }
+          exchangeDone: { ...exchangeDone },
+          updateReason: freshness.updateReason,
+          updateReasonText: freshness.updateReasonText
         });
       }
 
-      // Cập nhật trực tiếp bảng kết quả lọc sau mỗi lô để bộ lọc luôn chạy trên dữ liệu mới nhất
       if (opts.onIncrementalStocksUpdate && batchCacheToSave.length > 0) {
         opts.onIncrementalStocksUpdate(workingStocks, {
           lastDate: lastTradingDate,
@@ -841,6 +875,8 @@ export async function syncRealMarketDataFromVNDirect(
     cacheHitCount,
     invalidatedRefreshedCount: refreshedAdjustedCount,
     lastDate: lastTradingDate,
+    updateReason: freshness.updateReason,
+    updateReasonText: freshness.updateReasonText,
     breakdown: {
       HOSE: breakdown.HOSE,
       HNX: breakdown.HNX,

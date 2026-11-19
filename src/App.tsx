@@ -309,11 +309,10 @@ export default function App() {
     }
   };
 
-  // Khi user bấm Filter / chuyển tab Kết quả:
-  // 1. Lấy ngay mảng StockData[] mới nhất trên RAM để đảm bảo bộ lọc luôn lọc trên dữ liệu mới nhất (sửa Vấn đề 2).
-  // 2. Kiểm tra xem trên VNDirect có phiên mới hơn Cache hiện tại không -> Nếu còn thiếu ngày thì tự động chạy tải bù!
+  // Khi user bấm Filter / chuyển tab Kết quả hoặc bộ hẹn giờ Realtime trong phiên kích hoạt:
+  // 1. Lấy ngay mảng StockData[] mới nhất trên RAM để đảm bảo bộ lọc luôn lọc trên dữ liệu mới nhất.
+  // 2. Đối chiếu 3 chiều (Ngày + Giá Close/Volume VNINDEX + Số phút trôi qua trong phiên + Kiểm tra chốt giá cuối ngày buổi tối).
   const triggerIntradayT0FilterSync = async () => {
-    // Cập nhật ngay state stocks từ RAM Delta Cache để bộ lọc luôn dùng dữ liệu mới nhất đang có
     const latestRamStocks = buildStocksFromRamDeltaCache(stocks);
     setStocks(latestRamStocks);
 
@@ -329,11 +328,7 @@ export default function App() {
       if (check.needsUpdate) {
         isFastT0SyncingRef.current = false;
         setSyncStatusMsg(
-          `Xét duyệt: Cache đang ở phiên ${formatVnDateDisplay(
-            check.latestCachedDate
-          )}, thị trường đã có phiên ${formatVnDateDisplay(
-            check.latestMarketDate
-          )} — Đang tải bù ${Math.max(1, check.missingDaysEstimate)} ngày còn thiếu (36 lô)...`
+          `Xét duyệt Realtime: ${check.freshness.updateReasonText} — Đang cập nhật dữ liệu mới (36 lô)...`
         );
         void runBatchSyncWithBase(check.stocks, 'DELTA_ADJUSTED', false);
         return;
@@ -348,7 +343,7 @@ export default function App() {
   const handleStartBatchSync = () => {
     const todayStr = formatVnDateDisplay(getVietnamTodayDateStr());
     setSyncStatusMsg(
-      `Đang cập nhật nối tiếp dữ liệu mới nhất ngày ${todayStr} (36 lô · 45 mã/lô) từ VNDirect...`
+      `Đang đối chiếu Giá Close & cập nhật dữ liệu Realtime mới nhất ngày ${todayStr} (36 lô · 45 mã/lô) từ VNDirect...`
     );
     void runBatchSyncWithBase(stocks, syncMode, true);
   };
@@ -383,12 +378,13 @@ export default function App() {
   const [isPythonModalOpen, setIsPythonModalOpen] = useState(false);
   const [isGithubModalOpen, setIsGithubModalOpen] = useState(false);
 
-  // Khi mở app (Đúng quy trình 3 bước của Vấn đề 1):
-  // Bước 1: Mở Load -> Reload toàn bộ Data Cache Cũ từ IndexedDB lên RAM.
-  // Bước 2: Chạy kiểm tra trên VNDirect xem có Data mới hơn ngày trong Cache không.
-  // Bước 3: Xét duyệt:
-  //   - Nếu có ngày mới chưa có trong Cache -> Tự động chạy update nối tiếp chỉ phần thời gian còn thiếu (36 lô).
-  //   - Nếu Cache đã ở phiên mới nhất -> Không cần tải lại, lọc ngay trên RAM!
+  // Khi mở app:
+  // Bước 1: Mở Load -> Reload toàn bộ Data Cache Cũ (lịch sử đã chốt <= T-1 + nến T0 gần nhất) từ IndexedDB lên RAM.
+  // Bước 2: Chạy kiểm tra 1 request VNINDEX trên VNDirect lấy { Ngày, Giá Close, Volume }.
+  // Bước 3: Xét duyệt 3 chiều (Ngày + Giá Close & Volume VNINDEX + Số phút trôi qua trong phiên 09:00-15:05 + Chốt giá đóng cửa buổi tối):
+  //   - Nếu thiếu ngày, hoặc nhảy giá Close/Volume trong phiên, hoặc đã qua >= 2 phút trong phiên, hoặc mở app buổi tối cần chốt giá ATC cuối ngày:
+  //     Tự động chạy cập nhật 36 lô!
+  //   - Nếu đã khớp Ngày + Giá Close & Volume và đã chốt cuối ngày: Không cần tải lại, lọc ngay trên RAM!
   useEffect(() => {
     let mounted = true;
     (async () => {
@@ -411,7 +407,7 @@ export default function App() {
         }
       }
 
-      // BƯỚC 2: Kiểm tra có Data mới trên VNDirect không (1 request nhẹ kiểm tra VNINDEX)
+      // BƯỚC 2: Kiểm định 3 chiều (Ngày + Giá Close/Volume VNINDEX + Số phút trôi qua + Chốt giá buổi tối)
       const check = await checkAndDecideMarketDeltaSync(ramStocks);
       if (!mounted) return;
 
@@ -420,23 +416,17 @@ export default function App() {
       }
       setStocks(check.stocks);
 
-      // BƯỚC 3: Xét duyệt Update tiếp tục theo thời gian còn thiếu hoặc Không cần update
+      // BƯỚC 3: Xét duyệt Update hoặc Không cần update
       if (check.needsUpdate) {
-        setSyncStatusMsg(
-          `Đã nạp Cache cũ (Phiên ${formatVnDateDisplay(
-            check.latestCachedDate
-          )}) -> Phát hiện phiên mới ${formatVnDateDisplay(
-            check.latestMarketDate
-          )} trên VNDirect — Đang tải nối tiếp khoảng thời gian còn thiếu (36 lô)...`
-        );
+        setSyncStatusMsg(`${check.freshness.updateReasonText} — Đang đồng bộ (36 lô)...`);
         void runBatchSyncWithBase(check.stocks, 'DELTA_ADJUSTED', false);
       } else {
         setLastSyncDate(check.latestCachedDate);
         syncDateFilterRuleToLatest(check.latestCachedDate);
         setSyncStatusMsg(
-          `Đã nạp ${hydratedFromIdbCount.toLocaleString()} mã từ Cache IndexedDB (Phiên mới nhất ${formatVnDateDisplay(
-            check.latestCachedDate
-          )}) — Xét duyệt: Dữ liệu đã mới nhất, không cần tải lại!`
+          `Đã nạp ${hydratedFromIdbCount.toLocaleString()} mã từ Cache IndexedDB — ${check.freshness.updateReasonText}${
+            check.freshness.isEndOfDayLocked ? ' (Đã khóa chốt ATC cuối ngày)' : ''
+          }`
         );
         setTimeout(() => {
           if (mounted) setSyncStatusMsg(null);
@@ -449,6 +439,15 @@ export default function App() {
       abortSyncRef.current = true;
     };
   }, []);
+
+  // Bộ hẹn giờ kiểm tra Realtime tự động mỗi 5 phút 1 lần trong phiên giao dịch (09:00 - 15:05):
+  // Đối chiếu Ngày + Giá Close & Volume VNINDEX + Số phút trôi qua (>= 5 phút) để tự động làm mới nến T0
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void triggerIntradayT0FilterSync();
+    }, 5 * 60 * 1000);
+    return () => window.clearInterval(intervalId);
+  }, [isSyncing]);
 
   // Save custom presets
   const handleSaveCustomPreset = (name: string, description: string) => {

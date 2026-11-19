@@ -153,4 +153,12 @@
     - Sau mỗi lô cập nhật và mỗi khi người dùng bấm Filter / chuyển sang tab Kết quả, `buildStocksFromRamDeltaCache` tái tạo ngay mảng `StockData[]` mới nhất từ RAM (`[...candles_T1, pendingT0]`) và đồng bộ `target_date` của bộ lọc ngày về đúng phiên mới nhất (`18/11/2026`), đảm bảo bộ máy `evaluateScreener` luôn tính toán chỉ báo và lọc trên dữ liệu mới nhất.
   - **Vấn đề 3 (Giảm từ 97 lô về đúng 36 lô tốc độ cao):**
     - Khôi phục kích thước lô `DEFAULT_SYNC_BATCH_SIZE = 45` (**36–37 lô** cho toàn bộ 1.626 mã thay vì 97 lô) và loại bỏ thời gian chờ timeout của `finfo-api`, giúp tốc độ đồng bộ toàn thị trường nhanh gấp 3 lần.
+- **6. Đối Chiếu 3 Chiều (Ngày + Giá Close & Volume VNINDEX + Số Phút Trôi Qua Trong Phiên 09:00–15:05 + Kiểm Tra Chốt Giá Close Cuối Ngày Buổi Tối):**
+  - **Phân tách Lịch sử Quá khứ (`<= T-1`) và Phiên Hiện tại (`T0`):**
+    - Dữ liệu quá khứ từ ngày hôm trước (`T-1`) trở về trước đã đóng cửa nên được khóa cố định trong `IndexedDB (stock_delta_cache_v3)` và nạp thẳng lên RAM (`0ms`), tuyệt đối không tải lại (chỉ tải bổ sung những ngày còn thiếu hoặc khi phát hiện điều chỉnh giá chia tách `|Δ| > 0.05` tại điểm nối).
+    - Dữ liệu phiên hôm nay (`T0`): Không bao giờ kết luận "không cần cập nhật" nếu chỉ mới thấy trùng ngày (`Cache Date == Today`). Hệ thống luôn lưu bộ dấu vân tay `{ lastSyncDate, lastSyncTimestampMs, vnIndexClose, vnIndexVolume, isEndOfDayLocked }` trong `MarketCacheMeta` và kiểm định theo 3 tiêu chí:
+      1. **Đối chiếu Ngày + Giá Close & Volume của VNINDEX:** Nếu `|liveVnIndexClose - cachedVnIndexClose| >= 0.01` hoặc `|liveVnIndexVolume - cachedVnIndexVolume| >= 100` $\rightarrow$ Có dữ liệu khớp lệnh mới trên sàn, tự động chạy cập nhật làm mới nến `T0` (`INTRADAY_PRICE_VOL_CHANGE`).
+      2. **Tính theo Giờ / Phút trong phiên giao dịch (`09:00 – 15:05` Giờ VN — 5 phút check 1 lần):** Trong giờ giao dịch, nếu số phút trôi qua từ lần đồng bộ trước `>= 5 phút` (kèm bộ hẹn giờ tự động mỗi **5 phút check 1 lần**) $\rightarrow$ Tự động làm mới cây nến `T0` (`INTRADAY_TIME_ELAPSED`).
+      3. **Kiểm tra chốt Giá Close cuối ngày khi mở app buổi tối (`> 15:05`):** Nếu bản Cache trong ngày được đồng bộ trước `15:05` chiều (chưa chốt phiên ATC: `!isEndOfDayLocked`) hoặc Giá Close cuối ngày trên VNDirect khác với Cache $\rightarrow$ Tự động chạy cập nhật lần cuối để chốt cứng giá đóng cửa ATC cho toàn bộ 1.626 mã rồi mới đánh dấu `isEndOfDayLocked = true` (`EOD_FINAL_CLOSE_CHECK`).
+
 
