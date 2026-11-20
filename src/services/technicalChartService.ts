@@ -1,5 +1,14 @@
 import { StockData, TimeFrame, getVietnamTodayDateStr } from '../types/screener';
-import { loadCachedSymbolOhlcv, saveCachedSymbolOhlcv } from './marketCacheStorage';
+import {
+  loadCachedSymbolOhlcv,
+  saveCachedSymbolOhlcv,
+  getRamDeltaCacheMap,
+  syncSingleSymbolLiveCandlesToDeltaCache
+} from './marketCacheStorage';
+import {
+  beginChartPriority,
+  markSymbolSyncedByChart
+} from './syncPriorityCoordinator';
 
 export interface OhlcvCandle {
   timestamp: number;
@@ -69,6 +78,11 @@ export interface FullTechnicalChartData {
 // Cache for live + extended multi-year VNDirect OHLCV responses per symbol
 const liveOhlcvCache = new Map<string, OhlcvCandle[]>();
 const symbolYearsLoadedCache = new Map<string, number>();
+const symbolLastRealtimeFetchTime = new Map<string, string>();
+let liveVnindexCandlesCache: OhlcvCandle[] | null = null;
+let lastVnindexFetchMs = 0;
+let activePriorityAbortController: AbortController | null = null;
+
 const symbolExtendInFlight = new Map<
   string,
   Promise<{ candles: OhlcvCandle[]; yearsLoaded: number; addedBars: number }>
@@ -79,6 +93,11 @@ export const MAX_CHART_HISTORY_YEARS = 10;
 export function getSymbolYearsLoaded(symbol: string): number {
   const upper = symbol.trim().toUpperCase();
   return symbolYearsLoadedCache.get(upper) ?? 1;
+}
+
+export function getSymbolLastRealtimeFetchTime(symbol: string): string | null {
+  const upper = symbol.trim().toUpperCase();
+  return symbolLastRealtimeFetchTime.get(upper) ?? null;
 }
 
 // Normalize, deduplicate, sort ascending, and assign multi-year aware month labels
@@ -366,8 +385,80 @@ export function resolveStockOrMarketIndex(
   };
 }
 
-// Reconstruct realistic OHLCV candles from a stock's historical_closes & historical_volumes
+// Convert real DeltaCache candles (from RAM Delta Cache) into OhlcvCandle[] when available
+export function getImmediateCachedOhlcvForStock(stock: StockData): OhlcvCandle[] | null {
+  const upper = stock.symbol.trim().toUpperCase();
+  const memLive = liveOhlcvCache.get(upper);
+  if (memLive && memLive.length >= 25) {
+    return memLive;
+  }
+
+  const deltaItem = getRamDeltaCacheMap().get(upper);
+  if (deltaItem && !deltaItem.isBaselineSeed && deltaItem.candles.length >= 20) {
+    const combined = [...deltaItem.candles];
+    if (
+      deltaItem.pendingT0 &&
+      deltaItem.pendingT0.close > 0 &&
+      deltaItem.pendingT0.date >= (combined[combined.length - 1]?.date || '')
+    ) {
+      if (
+        combined.length > 0 &&
+        combined[combined.length - 1].date === deltaItem.pendingT0.date
+      ) {
+        combined[combined.length - 1] = {
+          date: deltaItem.pendingT0.date,
+          open: deltaItem.pendingT0.open,
+          high: deltaItem.pendingT0.high,
+          low: deltaItem.pendingT0.low,
+          close: deltaItem.pendingT0.close,
+          average: deltaItem.pendingT0.average,
+          volume: deltaItem.pendingT0.volume
+        };
+      } else {
+        combined.push({
+          date: deltaItem.pendingT0.date,
+          open: deltaItem.pendingT0.open,
+          high: deltaItem.pendingT0.high,
+          low: deltaItem.pendingT0.low,
+          close: deltaItem.pendingT0.close,
+          average: deltaItem.pendingT0.average,
+          volume: deltaItem.pendingT0.volume
+        });
+      }
+    }
+
+    const mapped: OhlcvCandle[] = combined.map((c, idx) => {
+      const parsedMs = Date.parse(`${c.date}T09:00:00Z`);
+      const ts = Number.isFinite(parsedMs)
+        ? Math.floor(parsedMs / 1000)
+        : Math.floor(Date.now() / 1000) - (combined.length - idx) * 86400;
+      const parts = c.date.split('-');
+      const shortDate =
+        parts.length === 3 ? `${parts[2]}/${parts[1]}` : c.date.slice(-5);
+      return {
+        timestamp: ts,
+        dateStr: c.date,
+        shortDate,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume
+      };
+    });
+    return normalizeAndLabelCandles(mapped);
+  }
+
+  return null;
+}
+
+// Reconstruct realistic OHLCV candles from a stock's RAM Delta Cache or historical_closes & historical_volumes
 export function buildOhlcvFromStock(stock: StockData): OhlcvCandle[] {
+  const fromDeltaCache = getImmediateCachedOhlcvForStock(stock);
+  if (fromDeltaCache && fromDeltaCache.length >= 20) {
+    return fromDeltaCache;
+  }
+
   const closes = stock.historical_closes;
   const vols = stock.historical_volumes;
   const len = closes.length;
@@ -436,65 +527,95 @@ const VNDIRECT_SYMBOL_MAP: Record<string, string> = {
   VN30F1M: 'VN30F1M'
 };
 
+function normalizeChartPrice(val: any, isMarketIndex: boolean, fallback = 0): number {
+  const num = Number(val);
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+  if (isMarketIndex) {
+    return Math.round(num * 100) / 100;
+  }
+  const normalized = num > 1000 ? num / 1000 : num;
+  return Math.round(normalized * 100) / 100;
+}
+
 // Low-level helper to fetch a specific [fromSec, toSec] window from VNDirect dchart API
+// Note: No custom headers so dchart-api text/plain responses never trigger preflight or 406 errors.
 async function fetchOhlcvWindowFromVNDirect(
   symbol: string,
   fromSec: number,
   toSec: number,
-  timeoutMs: number = 2800
+  timeoutMs: number = 2800,
+  minCandles: number = 3,
+  externalSignal?: AbortSignal
 ): Promise<OhlcvCandle[] | null> {
   const upper = symbol.trim().toUpperCase();
   const apiSymbol = VNDIRECT_SYMBOL_MAP[upper] || upper;
+  const isMarketIndex = Boolean(VNDIRECT_SYMBOL_MAP[upper]);
   const directUrl = `https://dchart-api.vndirect.com.vn/dchart/history?resolution=D&symbol=${encodeURIComponent(
     apiSymbol
   )}&from=${fromSec}&to=${toSec}`;
 
+  const perAttemptMs = Math.max(1100, Math.floor(timeoutMs / 2));
   const candidateUrls = [
     directUrl,
-    `${directUrl}&_r=1`,
-    `${directUrl}&_r=2`,
-    `${directUrl}&_r=3`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`
+    `${directUrl}&_r=1_${Date.now() % 10000}`,
+    `${directUrl}&_r=2_${Date.now() % 10000}`,
+    `${directUrl}&_r=3_${Date.now() % 10000}`
   ];
 
   for (const url of candidateUrls) {
+    if (externalSignal?.aborted) return null;
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const onExternalAbort = () => controller.abort();
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
+    const timer = setTimeout(() => controller.abort(), perAttemptMs);
 
     try {
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
       if (!res.ok) continue;
       const text = (await res.text()).trim();
       if (!text.startsWith('{')) continue;
       const data = JSON.parse(text);
-      if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= 5) {
+      if (data && data.s === 'ok' && Array.isArray(data.c) && data.c.length >= minCandles) {
         const len = data.c.length;
         const candles: OhlcvCandle[] = [];
 
         for (let i = 0; i < len; i++) {
-          const ts = data.t[i];
+          const ts = Number(data.t?.[i] ?? 0);
+          if (ts <= 0) continue;
           const dt = new Date((ts + 7 * 3600) * 1000);
           const yyyy = dt.getUTCFullYear();
           const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
           const dd = String(dt.getUTCDate()).padStart(2, '0');
 
+          const c = normalizeChartPrice(data.c[i], isMarketIndex);
+          if (c <= 0) continue;
+          const o = normalizeChartPrice(data.o?.[i], isMarketIndex, c);
+          const h = normalizeChartPrice(data.h?.[i], isMarketIndex, Math.max(o, c));
+          const l = normalizeChartPrice(data.l?.[i], isMarketIndex, Math.min(o, c));
+
           candles.push({
             timestamp: ts,
             dateStr: `${yyyy}-${mm}-${dd}`,
             shortDate: `${dd}/${mm}`,
-            open: Number(data.o?.[i] ?? data.c[i]),
-            high: Number(data.h?.[i] ?? data.c[i]),
-            low: Number(data.l?.[i] ?? data.c[i]),
-            close: Number(data.c[i]),
-            volume: Number(data.v?.[i] ?? 100000)
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: Math.max(0, Math.round(Number(data.v?.[i] ?? 100000)))
           });
         }
 
-        return normalizeAndLabelCandles(candles);
+        if (candles.length >= minCandles) {
+          return normalizeAndLabelCandles(candles);
+        }
       }
     } catch {
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+      if (externalSignal?.aborted) return null;
     }
   }
   return null;
@@ -572,70 +693,173 @@ function synthesizePriorOneYearOhlcv(
   return out;
 }
 
-// Fetch live OHLCV candles from local IndexedDB cache (including any previously extended years) or VNDirect 1-year default
+export interface LiveChartFetchOptions {
+  /**
+   * Nếu true (mặc định khi user bấm chọn mã xem biểu đồ), luôn ưu tiên gọi trực tiếp
+   * API VNDirect cho mã đang chọn để cập nhật cây nến T0 và lịch sử realtime mới nhất.
+   */
+  forceRealtimeRefresh?: boolean;
+  /**
+   * Nếu true (mặc định), tạm nhường băng thông từ quá trình đồng bộ theo lô (36 lô)
+   * cho đến khi mã biểu đồ đang chọn tải xong rồi mới cho đồng bộ lô chạy tiếp.
+   */
+  preemptBatchSync?: boolean;
+  /**
+   * Callback đẩy ngược dữ liệu StockData đã cập nhật realtime về bảng lọc và state của App.
+   */
+  onRealtimeStockUpdated?: (updatedStock: StockData) => void;
+}
+
+/**
+ * Ưu tiên tải dữ liệu Realtime OHLCV cho đúng 1 mã đang được chọn xem trên Biểu đồ Kỹ thuật:
+ * - Tạm dừng ngay quá trình đồng bộ theo lô (36 lô) qua `beginChartPriority(upper)` để nhường 100% băng thông cho đúng 1 mã biểu đồ này.
+ * - Nếu người dùng đổi/gõ mã khác liên tục, tự động hủy (abort) request cũ để mã mới nhất load ngay lập tức.
+ * - Đồng bộ ngược ngay vào RAM Delta Cache + IndexedDB (`stock_delta_cache_v3`) và state `stocks` của App.
+ * - Ngay khi mã biểu đồ hoàn tất, tự động giải phóng khóa ưu tiên (`releasePriority()`) để quá trình đồng bộ theo lô chạy tiếp đúng vị trí đang dở!
+ */
 export async function fetchLiveOhlcvFromVNDirect(
   symbol: string,
   timeoutMs: number = 2800,
-  fallbackStock?: StockData
+  fallbackStock?: StockData,
+  options?: LiveChartFetchOptions
 ): Promise<OhlcvCandle[] | null> {
   const upper = symbol.trim().toUpperCase();
-  if (liveOhlcvCache.has(upper)) {
-    return liveOhlcvCache.get(upper)!;
+  const forceRealtime = options?.forceRealtimeRefresh !== false;
+  const shouldPreempt = options?.preemptBatchSync !== false;
+  const isMarketIndex =
+    Boolean(VNDIRECT_SYMBOL_MAP[upper]) ||
+    MARKET_INDEX_STOCKS.some((m) => m.symbol === upper);
+
+  // 1. Nạp lịch sử đã lưu trong RAM hoặc IndexedDB (để giữ lại các năm quá khứ nếu đã kéo mở rộng > 1 năm)
+  let baseCached: OhlcvCandle[] | null = liveOhlcvCache.get(upper) || null;
+  let estYears = symbolYearsLoadedCache.get(upper) || 1;
+
+  if (!baseCached) {
+    const cachedRecord = await loadCachedSymbolOhlcv(upper);
+    if (cachedRecord && cachedRecord.candles.length >= 25) {
+      baseCached = normalizeAndLabelCandles(cachedRecord.candles);
+      estYears = Math.max(
+        1,
+        cachedRecord.yearsLoaded || Math.round(baseCached.length / 250)
+      );
+      liveOhlcvCache.set(upper, baseCached);
+      symbolYearsLoadedCache.set(upper, estYears);
+    }
   }
 
-  // 1. Check browser IndexedDB for previously cached symbol history (1 year or multi-year)
-  const cachedRecord = await loadCachedSymbolOhlcv(upper);
-  if (cachedRecord && cachedRecord.candles.length >= 25) {
-    const normalizedCached = normalizeAndLabelCandles(cachedRecord.candles);
-    const estYears = Math.max(
-      1,
-      cachedRecord.yearsLoaded || Math.round(normalizedCached.length / 250)
-    );
-    liveOhlcvCache.set(upper, normalizedCached);
-    symbolYearsLoadedCache.set(upper, estYears);
+  // Nếu không yêu cầu forceRealtime và đã có cache sẵn thì trả về nhanh
+  if (!forceRealtime && baseCached && baseCached.length >= 25) {
+    return baseCached;
+  }
 
-    // Refresh only the recent tail in background if the latest cached bar is older than today
-    const todayVn = getVietnamTodayDateStr();
-    const lastCachedDate = normalizedCached[normalizedCached.length - 1]?.dateStr;
-    if (lastCachedDate && lastCachedDate < todayVn) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      const fromRecentSec = nowSec - 86400 * 45;
-      void fetchOhlcvWindowFromVNDirect(upper, fromRecentSec, nowSec, 2400).then((recent) => {
-        if (recent && recent.length > 0) {
-          const currentInMem = liveOhlcvCache.get(upper) || normalizedCached;
-          const merged = normalizeAndLabelCandles([...currentInMem, ...recent]);
-          const yrs = symbolYearsLoadedCache.get(upper) || estYears;
-          liveOhlcvCache.set(upper, merged);
-          void saveCachedSymbolOhlcv(upper, merged, yrs);
-        }
-      });
+  // Hủy ngay request ưu tiên trước đó nếu người dùng vừa đổi/gõ mã khác
+  if (activePriorityAbortController) {
+    activePriorityAbortController.abort();
+  }
+  const currentAbortController = new AbortController();
+  activePriorityAbortController = currentAbortController;
+
+  // BẬT CỜ ƯU TIÊN BIỂU ĐỒ -> Tạm dừng luồng đồng bộ theo lô để dồn toàn lực tải nhanh 1 mã đang chọn
+  const releasePriority = shouldPreempt
+    ? beginChartPriority(upper, Math.max(6000, timeoutMs * 2 + 1500))
+    : () => {};
+
+  try {
+    // 2. ƯU TIÊN GỌI TRỰC TIẾP VNDIRECT CHO MÃ ĐANG CHỌN (Priority Single-Symbol Realtime Fetch)
+    const nowSec = Math.floor(Date.now() / 1000);
+    // Nếu đã có lịch sử > 1 năm (ví dụ 500-1000 nến), chỉ cần tải 45 ngày gần nhất để ghép realtime cực nhanh;
+    // Nếu chưa có hoặc mới ở mức 1 năm, tải full cửa sổ 400 ngày (~260 phiên) để đảm bảo giá điều chỉnh mới nhất
+    const fetchDaysWindow = baseCached && baseCached.length > 290 && estYears > 1 ? 45 : 400;
+    const fromSec = nowSec - 86400 * fetchDaysWindow;
+    const minRequired = fetchDaysWindow <= 45 ? 3 : 20;
+
+    // Chỉ gọi kèm VNINDEX cho Tầng 7 nếu chưa từng tải lần nào hoặc đã quá 3 phút (giảm tối đa số request trong chế độ ưu tiên)
+    const needVnindexRefresh =
+      upper !== 'VNINDEX' &&
+      (!liveVnindexCandlesCache || Date.now() - lastVnindexFetchMs > 180_000);
+
+    const [freshCandles, freshVnindex] = await Promise.all([
+      fetchOhlcvWindowFromVNDirect(
+        upper,
+        fromSec,
+        nowSec,
+        timeoutMs,
+        minRequired,
+        currentAbortController.signal
+      ),
+      needVnindexRefresh
+        ? fetchOhlcvWindowFromVNDirect(
+            'VNINDEX',
+            nowSec - 86400 * 400,
+            nowSec,
+            2400,
+            20,
+            currentAbortController.signal
+          )
+        : Promise.resolve(null)
+    ]);
+
+    if (currentAbortController.signal.aborted) {
+      return null;
     }
 
-    return normalizedCached;
+    if (freshVnindex && freshVnindex.length >= 20) {
+      liveVnindexCandlesCache = freshVnindex;
+      lastVnindexFetchMs = Date.now();
+    }
+
+    if (freshCandles && freshCandles.length >= minRequired) {
+      const merged =
+        baseCached && baseCached.length > freshCandles.length
+          ? normalizeAndLabelCandles([...baseCached, ...freshCandles])
+          : normalizeAndLabelCandles(freshCandles);
+
+      const finalYears = Math.max(estYears, Math.round(merged.length / 250) || 1);
+      liveOhlcvCache.set(upper, merged);
+      symbolYearsLoadedCache.set(upper, finalYears);
+      symbolLastRealtimeFetchTime.set(
+        upper,
+        new Date().toLocaleTimeString('vi-VN', { hour12: false })
+      );
+      void saveCachedSymbolOhlcv(upper, merged, finalYears);
+
+      if (upper === 'VNINDEX') {
+        liveVnindexCandlesCache = merged;
+        lastVnindexFetchMs = Date.now();
+      }
+
+      // Đồng bộ ngược dữ liệu Realtime của mã được chọn vào RAM Delta Cache + IndexedDB + State của App
+      if (fallbackStock && !isMarketIndex) {
+        const updatedStock = await syncSingleSymbolLiveCandlesToDeltaCache(fallbackStock, merged);
+        markSymbolSyncedByChart(upper);
+        if (updatedStock && options?.onRealtimeStockUpdated) {
+          options.onRealtimeStockUpdated(updatedStock);
+        }
+      }
+
+      return merged;
+    }
+
+    // 3. Nếu mạng tạm thời gián đoạn nhưng đã có baseCached thực từ IndexedDB hoặc RAM Delta Cache thì dùng lại
+    if (baseCached && baseCached.length >= 25) {
+      return baseCached;
+    }
+
+    if (fallbackStock) {
+      const fallbackCandles = normalizeAndLabelCandles(buildOhlcvFromStock(fallbackStock));
+      // Tuyệt đối KHÔNG ghi đè dữ liệu fallback giả lập vào IndexedDB (saveCachedSymbolOhlcv)
+      // để lần click tiếp theo luôn tải dữ liệu thực từ VNDirect!
+      return fallbackCandles;
+    }
+
+    return null;
+  } finally {
+    if (activePriorityAbortController === currentAbortController) {
+      activePriorityAbortController = null;
+    }
+    // GIẢI PHÓNG CỜ ƯU TIÊN -> Luồng đồng bộ 36 lô lập tức tiếp tục chạy lại ngay vị trí đang dở!
+    releasePriority();
   }
-
-  // 2. Otherwise fetch normal 1-year window (~400 calendar days = ~260 trading sessions)
-  const nowSec = Math.floor(Date.now() / 1000);
-  const fromSec = nowSec - 86400 * 400;
-  const freshCandles = await fetchOhlcvWindowFromVNDirect(upper, fromSec, nowSec, timeoutMs);
-
-  if (freshCandles && freshCandles.length >= 25) {
-    liveOhlcvCache.set(upper, freshCandles);
-    symbolYearsLoadedCache.set(upper, 1);
-    void saveCachedSymbolOhlcv(upper, freshCandles, 1);
-    return freshCandles;
-  }
-
-  // 3. Fallback to deterministic 1-year local history if network/CORS is offline
-  if (fallbackStock) {
-    const fallbackCandles = normalizeAndLabelCandles(buildOhlcvFromStock(fallbackStock));
-    liveOhlcvCache.set(upper, fallbackCandles);
-    symbolYearsLoadedCache.set(upper, 1);
-    void saveCachedSymbolOhlcv(upper, fallbackCandles, 1);
-    return fallbackCandles;
-  }
-
-  return null;
 }
 
 /**
@@ -676,7 +900,13 @@ export async function extendSymbolHistoryByOneYear(
     const toSec = earliestTs - 86400;
     const fromSec = earliestTs - 86400 * 372; // ~1 calendar year prior
 
-    let olderCandles = await fetchOhlcvWindowFromVNDirect(upper, fromSec, toSec, timeoutMs);
+    const releaseExtendPriority = beginChartPriority(upper, Math.max(5000, timeoutMs * 2));
+    let olderCandles: OhlcvCandle[] | null = null;
+    try {
+      olderCandles = await fetchOhlcvWindowFromVNDirect(upper, fromSec, toSec, timeoutMs);
+    } finally {
+      releaseExtendPriority();
+    }
     if (olderCandles) {
       olderCandles = olderCandles.filter((c) => c.dateStr < earliestCandle.dateStr);
     }
@@ -815,23 +1045,74 @@ function calcRsiSeries(closes: number[], period: number): number[] {
   return rsi;
 }
 
-// Build synthetic or live VNINDEX series aligned with the stock's dates (seeded from newest bar backward so prepending older years keeps recent bars identical)
+// Build live or fallback VNINDEX series aligned with the stock's dates
 function buildAlignedVnindexCandles(baseCandles: OhlcvCandle[]): OhlcvCandle[] {
   const len = baseCandles.length;
   const out: OhlcvCandle[] = new Array(len);
+
+  const realVni = liveVnindexCandlesCache || liveOhlcvCache.get('VNINDEX') || null;
+  const realVniByDate = new Map<string, OhlcvCandle>();
+  if (realVni && realVni.length > 0) {
+    for (const vc of realVni) {
+      realVniByDate.set(vc.dateStr, vc);
+    }
+  }
+
+  const latestRealClose =
+    realVni && realVni.length > 0 ? realVni[realVni.length - 1].close : 1743.07;
+
   const closes: number[] = new Array(len);
-  let curr = 1740.1;
+  let curr = latestRealClose;
   closes[len - 1] = curr;
 
   for (let i = len - 2; i >= 0; i--) {
-    const offsetFromEnd = len - 1 - i;
-    const n = seededNoise('VNINDEX', offsetFromEnd);
-    const step = (n - 0.485) * 14.5;
-    curr = Math.max(680, Math.round((curr - step) * 100) / 100);
-    closes[i] = curr;
+    const exactReal = realVniByDate.get(baseCandles[i].dateStr);
+    if (exactReal) {
+      curr = exactReal.close;
+      closes[i] = curr;
+    } else {
+      const offsetFromEnd = len - 1 - i;
+      const n = seededNoise('VNINDEX', offsetFromEnd);
+      const step = (n - 0.485) * 14.5;
+      curr = Math.max(680, Math.round((curr - step) * 100) / 100);
+      closes[i] = curr;
+    }
   }
 
+  let lastMatchedReal: OhlcvCandle | null =
+    realVni && realVni.length > 0 ? realVni[0] : null;
+
   for (let i = 0; i < len; i++) {
+    const exactReal = realVniByDate.get(baseCandles[i].dateStr);
+    if (exactReal) {
+      lastMatchedReal = exactReal;
+      out[i] = {
+        ...baseCandles[i],
+        open: exactReal.open,
+        high: exactReal.high,
+        low: exactReal.low,
+        close: exactReal.close
+      };
+      continue;
+    }
+
+    // If within the date range of realVni (e.g. weekly aggregation or holiday alignment), use closest prior real VNINDEX candle
+    if (
+      realVni &&
+      realVni.length > 0 &&
+      baseCandles[i].dateStr >= realVni[0].dateStr &&
+      lastMatchedReal
+    ) {
+      out[i] = {
+        ...baseCandles[i],
+        open: lastMatchedReal.open,
+        high: lastMatchedReal.high,
+        low: lastMatchedReal.low,
+        close: lastMatchedReal.close
+      };
+      continue;
+    }
+
     const offsetFromEnd = len - 1 - i;
     const c = closes[i];
     const prev = i > 0 ? closes[i - 1] : c - 2.5;

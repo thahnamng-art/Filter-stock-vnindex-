@@ -258,10 +258,17 @@ export const SyncInspectorModal: React.FC<SyncInspectorModalProps> = ({
           {batchProgress && (
             <div className="space-y-1.5 pt-1">
               <div className="flex flex-wrap items-center justify-between text-[11px] tabular-nums text-slate-300 gap-2">
-                <span>
-                  Lô <strong>{batchProgress.batchIndex}</strong>/{batchProgress.totalBatches} (45 mã/lô) · Đã xử lý{' '}
-                  <strong className="text-purple-300">{batchProgress.processed.toLocaleString()}</strong> /{' '}
-                  {batchProgress.totalTarget.toLocaleString()} mã
+                <span className="flex flex-wrap items-center gap-1.5">
+                  <span>
+                    Lô <strong>{batchProgress.batchIndex}</strong>/{batchProgress.totalBatches} (45 mã/lô) · Đã xử lý{' '}
+                    <strong className="text-purple-300">{batchProgress.processed.toLocaleString()}</strong> /{' '}
+                    {batchProgress.totalTarget.toLocaleString()} mã
+                  </span>
+                  {batchProgress.pausedForChartSymbol && (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[10px] font-semibold">
+                      Đang nhường ưu tiên Biểu đồ: {batchProgress.pausedForChartSymbol} (tự chạy tiếp sau khi xong)
+                    </span>
+                  )}
                 </span>
                 <span>
                   Nối tiếp &amp; Cập nhật T0:{' '}

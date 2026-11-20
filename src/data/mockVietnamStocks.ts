@@ -21,6 +21,12 @@ import {
   setKnownLiveMarketProbe,
   getVietnamSessionClockInfo
 } from '../services/marketCacheStorage';
+import {
+  isChartPriorityActive,
+  getActiveChartPrioritySymbol,
+  waitForChartPriorityIdle,
+  wasRecentlySyncedByChart
+} from '../services/syncPriorityCoordinator';
 
 interface RawStockItem {
   symbol: string;
@@ -84,6 +90,7 @@ export interface SyncBatchProgress {
   exchangeDone: { HOSE: number; HNX: number; UPCOM: number };
   updateReason?: DeltaSyncUpdateReason;
   updateReasonText?: string;
+  pausedForChartSymbol?: string | null;
 }
 
 export interface MarketIndexLiveStatus {
@@ -606,19 +613,97 @@ export async function syncRealMarketDataFromVNDirect(
       const batchCacheToSave: StockDeltaCacheItem[] = [];
       const batchTime = new Date().toLocaleTimeString('vi-VN', { hour12: false });
 
-      await Promise.all(
-        batchSymbols.map(async (sym) => {
-          const stock = stockBySymbol.get(sym)!;
-          const prevCache = cacheMap.get(sym);
+      // Nếu người dùng đang mở Biểu đồ / đổi mã -> Tạm dừng ngay trước khi chạy lô để nhường 100% băng thông cho 1 mã biểu đồ
+      if (isChartPriorityActive()) {
+        if (opts.onBatchProgress) {
+          const totalSyncedNow = cacheHitCount + refreshedAdjustedCount;
+          const processedNow = Math.max(
+            totalSyncedNow,
+            sortedSymbols.length - totalToProcess + b
+          );
+          opts.onBatchProgress({
+            processed: processedNow,
+            totalTarget: sortedSymbols.length,
+            totalUniverse,
+            liveUpdatedCount: totalSyncedNow,
+            fallbackCount: Math.max(0, processedNow - totalSyncedNow),
+            cacheHitCount,
+            invalidatedCount: refreshedAdjustedCount,
+            refreshedAdjustedCount,
+            t0SnapshotCount: totalSyncedNow,
+            batchIndex,
+            totalBatches,
+            currentBatchSymbols: batchSymbols,
+            recentLogs: [...recentLogs],
+            exchangeDone: { ...exchangeDone },
+            updateReason: freshness.updateReason,
+            updateReasonText: freshness.updateReasonText,
+            pausedForChartSymbol: getActiveChartPrioritySymbol()
+          });
+        }
+        await waitForChartPriorityIdle(opts.shouldAbort);
+        if (opts.shouldAbort && opts.shouldAbort()) {
+          break;
+        }
+      }
 
-          if (!prevCache || prevCache.candles.length < 20) {
-            const fullCandles = await fetchVNDirectDChartCandles(
-              sym,
-              fromSec380d,
-              toSec,
-              timeoutMs,
-              20
+      // Chạy pool 6 worker song song trong từng lô 45 mã (khớp chuẩn 6 kết nối/host của trình duyệt)
+      // để có thể TẠM DỪNG TỨC THÌ (< 100ms) ngay khi Biểu đồ ưu tiên tải 1 mã và TỰ ĐỘNG CHẠY TIẾP ngay khi Biểu đồ tải xong!
+      let nextSymIdx = 0;
+      const BATCH_WORKER_CONCURRENCY = 6;
+      const processOneSymbol = async (sym: string): Promise<void> => {
+        if (opts.shouldAbort && opts.shouldAbort()) return;
+
+        // Nhường quyền ưu tiên nếu Biểu đồ vừa kích hoạt tải mã mới giữa chừng trong lô
+        if (isChartPriorityActive()) {
+          if (opts.onBatchProgress) {
+            const totalSyncedNow = cacheHitCount + refreshedAdjustedCount;
+            const processedNow = Math.max(
+              totalSyncedNow,
+              sortedSymbols.length - totalToProcess + b + nextSymIdx
             );
+            opts.onBatchProgress({
+              processed: Math.min(sortedSymbols.length, processedNow),
+              totalTarget: sortedSymbols.length,
+              totalUniverse,
+              liveUpdatedCount: totalSyncedNow,
+              fallbackCount: Math.max(0, processedNow - totalSyncedNow),
+              cacheHitCount,
+              invalidatedCount: refreshedAdjustedCount,
+              refreshedAdjustedCount,
+              t0SnapshotCount: totalSyncedNow,
+              batchIndex,
+              totalBatches,
+              currentBatchSymbols: batchSymbols,
+              recentLogs: [...recentLogs],
+              exchangeDone: { ...exchangeDone },
+              updateReason: freshness.updateReason,
+              updateReasonText: freshness.updateReasonText,
+              pausedForChartSymbol: getActiveChartPrioritySymbol()
+            });
+          }
+          await waitForChartPriorityIdle(opts.shouldAbort);
+          if (opts.shouldAbort && opts.shouldAbort()) return;
+        }
+
+        const stock = stockBySymbol.get(sym)!;
+        const prevCache = cacheMap.get(sym);
+
+        // Nếu mã này VỪA ĐƯỢC Biểu đồ ưu tiên tải dữ liệu Realtime mới nhất trong vòng 90 giây qua -> tái sử dụng luôn, không gọi trùng!
+        if (wasRecentlySyncedByChart(sym, 90_000) && prevCache && !prevCache.isBaselineSeed && prevCache.pendingT0) {
+          cacheHitCount++;
+          exchangeDone[stock.exchange]++;
+          return;
+        }
+
+        if (!prevCache || prevCache.candles.length < 20) {
+          const fullCandles = await fetchVNDirectDChartCandles(
+            sym,
+            fromSec380d,
+            toSec,
+            timeoutMs,
+            20
+          );
             if (fullCandles && fullCandles.length >= 20) {
               const { item: newItem, latestDate } = buildDeltaCacheItemFromCandles(
                 sym,
@@ -790,6 +875,17 @@ export async function syncRealMarketDataFromVNDirect(
           } else {
             exchangeDone[stock.exchange]++;
           }
+      };
+
+      const workerCount = Math.min(BATCH_WORKER_CONCURRENCY, batchSymbols.length);
+      await Promise.all(
+        Array.from({ length: workerCount }, async () => {
+          while (true) {
+            if (opts.shouldAbort && opts.shouldAbort()) break;
+            const idx = nextSymIdx++;
+            if (idx >= batchSymbols.length) break;
+            await processOneSymbol(batchSymbols[idx]);
+          }
         })
       );
 
@@ -845,7 +941,8 @@ export async function syncRealMarketDataFromVNDirect(
           recentLogs: [...recentLogs],
           exchangeDone: { ...exchangeDone },
           updateReason: freshness.updateReason,
-          updateReasonText: freshness.updateReasonText
+          updateReasonText: freshness.updateReasonText,
+          pausedForChartSymbol: null
         });
       }
 

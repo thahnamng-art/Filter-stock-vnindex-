@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { 
   Plus, 
   RotateCcw, 
@@ -500,11 +500,29 @@ export default function App() {
     );
   }, [evaluatedStocks, matchedStocks, chartSymbol]);
 
+  const [chartPriorityNonce, setChartPriorityNonce] = useState<number>(0);
+
   const handleOpenStockChart = (stock: StockData) => {
     setChartSymbol(stock.symbol);
+    setChartPriorityNonce((n) => n + 1);
     setActiveTab('CHART');
     setDesktopRightTab('CHART');
   };
+
+  // Khi biểu đồ ưu tiên tải dữ liệu Realtime cho 1 mã được chọn xong -> cập nhật ngay mã đó vào state & bảng lọc
+  const handleRealtimeChartStockUpdated = useCallback((updatedStock: StockData) => {
+    setStocks((prev) => {
+      let found = false;
+      const next = prev.map((s) => {
+        if (s.symbol === updatedStock.symbol) {
+          found = true;
+          return updatedStock;
+        }
+        return s;
+      });
+      return found ? next : prev;
+    });
+  }, []);
 
   // Rule operations (tự động ghép nến T0 từ 1 API size=2000 trên nền Cache T-1 RAM)
   const handleToggleRule = (id: string) => {
@@ -831,8 +849,13 @@ export default function App() {
                   <FialdaTechnicalChart
                     selectedStock={activeChartStock}
                     allStocks={evaluatedStocks}
-                    onSelectStock={(st) => setChartSymbol(st.symbol)}
+                    onSelectStock={(st) => {
+                      setChartSymbol(st.symbol);
+                      setChartPriorityNonce((n) => n + 1);
+                    }}
                     onOpenStockDetailModal={(st) => setSelectedStockDetail(st)}
+                    onRealtimeStockUpdated={handleRealtimeChartStockUpdated}
+                    priorityTriggerNonce={chartPriorityNonce}
                     activeRulesCount={activeRulesCount}
                   />
                 </div>
@@ -884,7 +907,10 @@ export default function App() {
               </button>
 
               <button
-                onClick={() => setActiveTab('CHART')}
+                onClick={() => {
+                  setActiveTab('CHART');
+                  setChartPriorityNonce((n) => n + 1);
+                }}
                 className={`flex flex-col items-center justify-center gap-1 relative transition-colors ${
                   activeTab === 'CHART' ? 'text-purple-400 font-bold' : 'text-slate-400 hover:text-slate-200'
                 }`}
@@ -998,7 +1024,10 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setDesktopRightTab('CHART')}
+                    onClick={() => {
+                      setDesktopRightTab('CHART');
+                      setChartPriorityNonce((n) => n + 1);
+                    }}
                     className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
                       desktopRightTab === 'CHART'
                         ? 'bg-purple-600 text-white shadow-sm'
@@ -1028,8 +1057,13 @@ export default function App() {
                   <FialdaTechnicalChart
                     selectedStock={activeChartStock}
                     allStocks={evaluatedStocks}
-                    onSelectStock={(st) => setChartSymbol(st.symbol)}
+                    onSelectStock={(st) => {
+                      setChartSymbol(st.symbol);
+                      setChartPriorityNonce((n) => n + 1);
+                    }}
                     onOpenStockDetailModal={(st) => setSelectedStockDetail(st)}
+                    onRealtimeStockUpdated={handleRealtimeChartStockUpdated}
+                    priorityTriggerNonce={chartPriorityNonce}
                     activeRulesCount={activeRulesCount}
                   />
                 )}

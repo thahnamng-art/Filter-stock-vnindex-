@@ -879,7 +879,80 @@ export interface CachedSymbolOhlcvRecord {
   updatedAt: string;
 }
 
-const SYMBOL_OHLCV_PREFIX = 'symbol_ohlcv_v1_';
+const SYMBOL_OHLCV_PREFIX = 'symbol_ohlcv_v2_';
+
+/**
+ * Đồng bộ trực tiếp dữ liệu nến OHLCV Realtime của 1 mã vừa được ưu tiên tải trên Biểu đồ
+ * ngược về bộ nhớ RAM Delta Cache (ramDeltaCacheMap) + IndexedDB (stock_delta_cache_v3)
+ * và trả về đối tượng StockData mới nhất để cập nhật tức thì cho cả Biểu đồ và Bộ lọc.
+ */
+export async function syncSingleSymbolLiveCandlesToDeltaCache(
+  baseStock: StockData,
+  liveOhlcvCandles: CachedSymbolOhlcvCandle[]
+): Promise<StockData | null> {
+  if (!baseStock || !Array.isArray(liveOhlcvCandles) || liveOhlcvCandles.length < 20) {
+    return null;
+  }
+
+  const sym = baseStock.symbol.trim().toUpperCase();
+  const recentSlice = liveOhlcvCandles.slice(-260);
+  const deltaCandles: DeltaHistoricalCandle[] = recentSlice.map((c) => ({
+    date: c.dateStr,
+    open: c.open,
+    high: c.high,
+    low: c.low,
+    close: c.close,
+    average: Math.round(((c.open + c.high + c.low + c.close) / 4) * 100) / 100,
+    volume: c.volume
+  }));
+
+  const lastCandle = deltaCandles[deltaCandles.length - 1];
+  const latestDate = lastCandle.date;
+  let t1Candles = deltaCandles.filter((c) => c.date < latestDate).slice(-250);
+  if (t1Candles.length < 15 && deltaCandles.length >= 2) {
+    t1Candles = deltaCandles.slice(0, -1).slice(-250);
+  } else if (t1Candles.length === 0) {
+    t1Candles = deltaCandles.slice(-250);
+  }
+
+  const lastT1 = t1Candles[t1Candles.length - 1] || lastCandle;
+  const refPrice =
+    baseStock.exchange === 'UPCOM' ? lastT1.average || lastT1.close : lastT1.close;
+  const change = Math.round((lastCandle.close - refPrice) * 100) / 100;
+  const changePct =
+    refPrice > 0 ? Math.round(((lastCandle.close - refPrice) / refPrice) * 10000) / 100 : 0;
+  const totalValueB =
+    Math.round(((lastCandle.volume * lastCandle.close * 1000) / 1e9) * 10) / 10;
+
+  const updatedDeltaItem: StockDeltaCacheItem = {
+    symbol: sym,
+    exchange: baseStock.exchange,
+    lastSyncDate: lastT1.date,
+    lastClose: lastT1.close,
+    lastAvgPrice: lastT1.average,
+    candles: t1Candles,
+    verifiedT0Date: latestDate,
+    lastUpdatedTimestampMs: Date.now(),
+    isBaselineSeed: false,
+    pendingT0: {
+      date: lastCandle.date,
+      open: lastCandle.open,
+      high: lastCandle.high,
+      low: lastCandle.low,
+      close: lastCandle.close,
+      average: lastCandle.average,
+      volume: lastCandle.volume,
+      basicPrice: refPrice,
+      change,
+      changePct,
+      totalValueB
+    }
+  };
+
+  await saveStockDeltaCachesBatch([updatedDeltaItem]);
+  const rebuilt = buildStocksFromRamDeltaCache([baseStock]);
+  return rebuilt[0] || null;
+}
 
 export async function loadCachedSymbolOhlcv(
   symbol: string

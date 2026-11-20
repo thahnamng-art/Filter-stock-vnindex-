@@ -45,6 +45,8 @@ import { StockData, TimeFrame } from '../types/screener';
 import {
   computeFullTechnicalChart,
   fetchLiveOhlcvFromVNDirect,
+  getImmediateCachedOhlcvForStock,
+  getSymbolLastRealtimeFetchTime,
   extendSymbolHistoryByOneYear,
   getSymbolYearsLoaded,
   MAX_CHART_HISTORY_YEARS,
@@ -59,6 +61,8 @@ interface FialdaTechnicalChartProps {
   onSelectStock: (stock: StockData) => void;
   onOpenStockDetailModal?: (stock: StockData) => void;
   activeRulesCount?: number;
+  onRealtimeStockUpdated?: (updatedStock: StockData) => void;
+  priorityTriggerNonce?: number;
 }
 
 interface IndicatorVisibility {
@@ -113,7 +117,9 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
   allStocks,
   onSelectStock,
   onOpenStockDetailModal,
-  activeRulesCount = 0
+  activeRulesCount = 0,
+  onRealtimeStockUpdated,
+  priorityTriggerNonce = 0
 }) => {
   const [timeframe, setTimeframe] = useState<TimeFrame>('1D');
   const [visibleBarsCount, setVisibleBarsCount] = useState<number>(75);
@@ -222,44 +228,112 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
   const [showSellSignals, setShowSellSignals] = useState<boolean>(true);
 
   // Live VNDirect OHLCV state + per-symbol multi-year local cache state
-  const [liveCandles, setLiveCandles] = useState<OhlcvCandle[] | null>(null);
+  const [liveCandles, setLiveCandles] = useState<OhlcvCandle[] | null>(() =>
+    getImmediateCachedOhlcvForStock(selectedStock)
+  );
   const [isLoadingLive, setIsLoadingLive] = useState<boolean>(false);
   const [yearsLoaded, setYearsLoaded] = useState<number>(1);
   const [isExtendingHistory, setIsExtendingHistory] = useState<boolean>(false);
+  const [lastRealtimeFetchTime, setLastRealtimeFetchTime] = useState<string | null>(() =>
+    getSymbolLastRealtimeFetchTime(selectedStock.symbol)
+  );
   const lastAutoExtendTotalRef = useRef<number>(0);
+  const selectedStockRef = useRef<StockData>(selectedStock);
+  selectedStockRef.current = selectedStock;
+  const onRealtimeStockUpdatedRef = useRef(onRealtimeStockUpdated);
+  onRealtimeStockUpdatedRef.current = onRealtimeStockUpdated;
 
-  // Fetch live or locally cached multi-year OHLCV whenever selectedStock.symbol changes
+  // Hàm ưu tiên tải mới dữ liệu Realtime từ VNDirect cho riêng mã đang được chọn
+  const triggerPriorityRealtimeSymbolRefresh = async (targetStock: StockData) => {
+    setIsLoadingLive(true);
+    try {
+      const candles = await fetchLiveOhlcvFromVNDirect(
+        targetStock.symbol,
+        2800,
+        targetStock,
+        {
+          forceRealtimeRefresh: true,
+          onRealtimeStockUpdated: (updated) => {
+            onRealtimeStockUpdatedRef.current?.(updated);
+          }
+        }
+      );
+      if (selectedStockRef.current.symbol === targetStock.symbol && candles) {
+        setLiveCandles([...candles]);
+        setYearsLoaded(getSymbolYearsLoaded(targetStock.symbol));
+        setLastRealtimeFetchTime(getSymbolLastRealtimeFetchTime(targetStock.symbol));
+      }
+    } finally {
+      if (selectedStockRef.current.symbol === targetStock.symbol) {
+        setIsLoadingLive(false);
+      }
+    }
+  };
+
+  const prevPrioritySymbolRef = useRef<string>(selectedStock.symbol);
+
+  // Khi user chuyển sang mục Biểu đồ, click chọn mã, hoặc gõ đổi sang mã khác:
+  // 1) Nạp tức thì cache đang có trên RAM của đúng mã đó (0ms, không bị giữ nến của mã cũ)
+  // 2) BẬT CHẾ ĐỘ ƯU TIÊN -> Tạm dừng quá trình đồng bộ theo lô để tải Realtime mới nhất cho đúng 1 mã đang chọn
+  // 3) Sau khi mã biểu đồ hoàn tất -> Tự động cập nhật RAM/IndexedDB + Bảng lọc và để quá trình đồng bộ theo lô chạy tiếp!
   useEffect(() => {
     let cancelled = false;
-    setPanOffset(-6);
-    setPaneScales(DEFAULT_PANE_SCALES);
-    setPaneHeightFactors(DEFAULT_PANE_HEIGHT_FACTORS);
-    setPriceVerticalOffset(0);
-    setHoverIndex(null);
-    setIsLoadingLive(true);
-    setIsExtendingHistory(false);
-    lastAutoExtendTotalRef.current = 0;
+    const isSymbolChanged = prevPrioritySymbolRef.current !== selectedStock.symbol;
+    prevPrioritySymbolRef.current = selectedStock.symbol;
 
-    fetchLiveOhlcvFromVNDirect(selectedStock.symbol, 2600, selectedStock)
+    if (isSymbolChanged) {
+      setPanOffset(-6);
+      setPaneScales(DEFAULT_PANE_SCALES);
+      setPaneHeightFactors(DEFAULT_PANE_HEIGHT_FACTORS);
+      setPriceVerticalOffset(0);
+      setHoverIndex(null);
+      setIsExtendingHistory(false);
+      lastAutoExtendTotalRef.current = 0;
+
+      // Hiển thị ngay nến thực đã có trong RAM Delta Cache (nếu có) trong lúc chờ request Realtime ưu tiên
+      const immediateCached = getImmediateCachedOhlcvForStock(selectedStock);
+      setLiveCandles(immediateCached);
+      setYearsLoaded(getSymbolYearsLoaded(selectedStock.symbol));
+      setLastRealtimeFetchTime(getSymbolLastRealtimeFetchTime(selectedStock.symbol));
+    }
+    setIsLoadingLive(true);
+
+    fetchLiveOhlcvFromVNDirect(selectedStock.symbol, 2800, selectedStock, {
+      forceRealtimeRefresh: true,
+      preemptBatchSync: true,
+      onRealtimeStockUpdated: (updated) => {
+        if (!cancelled) {
+          onRealtimeStockUpdatedRef.current?.(updated);
+        }
+      }
+    })
       .then((candles) => {
         if (!cancelled) {
-          setLiveCandles(candles);
+          if (candles) {
+            setLiveCandles([...candles]);
+          }
           setYearsLoaded(getSymbolYearsLoaded(selectedStock.symbol));
+          setLastRealtimeFetchTime(getSymbolLastRealtimeFetchTime(selectedStock.symbol));
           setIsLoadingLive(false);
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setLiveCandles(null);
-          setYearsLoaded(1);
           setIsLoadingLive(false);
         }
       });
 
+    // Tự động làm mới Realtime mỗi 30 giây riêng cho mã đang mở trên biểu đồ
+    const realtimeTimer = window.setInterval(() => {
+      if (cancelled) return;
+      void triggerPriorityRealtimeSymbolRefresh(selectedStockRef.current);
+    }, 30_000);
+
     return () => {
       cancelled = true;
+      window.clearInterval(realtimeTimer);
     };
-  }, [selectedStock.symbol]);
+  }, [selectedStock.symbol, priorityTriggerNonce]);
 
   // Compute full 7-pane chart data
   const chartData = useMemo(() => {
@@ -421,9 +495,13 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
   }, [combinedUniverse, allStocks, searchQuery]);
 
   const handleSelectSymbolFromSearch = (stock: StockData) => {
+    const isSameSymbol = stock.symbol.toUpperCase() === selectedStock.symbol.toUpperCase();
     onSelectStock(stock);
     setIsSearchOpen(false);
     setSearchQuery('');
+    if (isSameSymbol) {
+      void triggerPriorityRealtimeSymbolRefresh(stock);
+    }
   };
 
   const handleSearchKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -1230,6 +1308,18 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
           <button
             type="button"
             onClick={() => {
+              void triggerPriorityRealtimeSymbolRefresh(selectedStock);
+            }}
+            disabled={isLoadingLive}
+            className="w-7 h-7 rounded flex items-center justify-center text-emerald-400 hover:text-emerald-300 hover:bg-[#1e222d] disabled:opacity-60 transition-colors"
+            title={`Ưu tiên tải lại dữ liệu Realtime mới nhất cho mã ${selectedStock.symbol} từ VNDirect`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isLoadingLive ? 'animate-spin text-purple-400' : ''}`} />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
               setIsSearchOpen(true);
               setTimeout(() => searchInputRef.current?.focus(), 50);
             }}
@@ -2008,14 +2098,20 @@ export const FialdaTechnicalChart: React.FC<FialdaTechnicalChartProps> = ({
                     className={`px-1.5 py-0.2 rounded text-[9px] font-semibold border ${
                       isExtendingHistory
                         ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 animate-pulse'
-                        : yearsLoaded > 1
+                        : isLoadingLive
+                        ? 'bg-purple-500/20 border-purple-500/50 text-purple-300 animate-pulse'
+                        : lastRealtimeFetchTime
                         ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
                         : 'bg-slate-800/80 border-slate-700 text-slate-400'
                     }`}
                   >
                     {isExtendingHistory
                       ? `Đang tải thêm +1 năm cho ${selectedStock.symbol}...`
-                      : `Local: ${yearsLoaded} năm (${chartData.points.length} phiên)`}
+                      : isLoadingLive
+                      ? `Đang tải Realtime ${selectedStock.symbol}...`
+                      : lastRealtimeFetchTime
+                      ? `Live ${lastRealtimeFetchTime} · ${yearsLoaded}N (${chartData.points.length}P)`
+                      : `Cache: ${yearsLoaded} năm (${chartData.points.length} phiên)`}
                   </span>
                 </div>
 
